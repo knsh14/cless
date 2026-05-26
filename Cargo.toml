@@ -1,0 +1,45 @@
+[package]
+name = "cless"
+version = "0.0.1"
+edition = "2024"
+authors = ["Kenshi Kamata"]
+license = "MIT OR Apache-2.0"
+description = "A less-like terminal pager with tree-sitter syntax highlighting"
+repository = "https://github.com/knsh14/cless"
+readme = "README.md"
+
+[dependencies]
+crossterm = "0.28"
+unicode-width = "0.2"
+regex = "1"
+
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-go = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter-md = "0.5"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"
+tree-sitter-c = "0.24"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# cargo-binstall: install prebuilt binaries from GitHub Releases.
+#   $ cargo binstall cless
+# The release workflow in .github/workflows/release.yml uploads assets matching
+# this URL template on every `v*` tag push.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
