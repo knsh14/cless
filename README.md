@@ -1,31 +1,31 @@
 # cless
 
-シンタックスハイライト付きの less クローン。tree-sitter でファイルをパースし、less のキーバインドに準拠したターミナルページャを提供する。
+A `less`-like terminal pager with tree-sitter syntax highlighting.
 
-## 特徴
+## Features
 
-- **less 互換のキーバインド**: 数字プレフィクス (`5j`, `100G`, `50%`)、移動・ページ・半ページ・先頭/末尾・パーセント指定・横スクロール
-- **検索**: `/pattern` / `?pattern`、`n` / `N` で反復、smart-case (全小文字なら大文字無視)、マッチを反転表示
-- **15 言語の tree-sitter ハイライト**: Rust, Python, JavaScript, TypeScript (TSX 含む), JSON, Go, Bash, TOML, YAML, HTML, CSS, C, Markdown
-- **citruszest パレット** ([zootedb0t/citruszest.nvim](https://github.com/zootedb0t/citruszest.nvim) 由来) を truecolor で出力
-- 言語検出は拡張子 → 特殊ファイル名 (`.bashrc` 等) → shebang の順
+- **`less`-compatible keybindings**: number-prefix counts (`5j`, `100G`, `50%`), line / page / half-page motion, top / bottom / percent jumps, horizontal scroll
+- **Search**: `/pattern` and `?pattern`, repeat with `n` / `N`, smart-case (all-lowercase pattern is case-insensitive), matches shown in reverse video
+- **Tree-sitter highlighting for 15 languages**: Rust, Python, JavaScript, TypeScript (incl. TSX), JSON, Go, Bash, TOML, YAML, HTML, CSS, C, Markdown
+- **citruszest palette** (from [zootedb0t/citruszest.nvim](https://github.com/zootedb0t/citruszest.nvim)) emitted as truecolor ANSI
+- Language detection: file extension → special filenames (`.bashrc` etc.) → shebang
 
-## インストール
+## Installation
 
-### 推奨: `cargo binstall` (prebuilt バイナリをダウンロード、C コンパイラ不要)
+### Recommended: `cargo binstall` (downloads a prebuilt binary, no C toolchain needed)
 
 ```sh
 cargo binstall cless
 ```
 
-GitHub Releases の prebuilt バイナリを引いてくるので即終わる。対応ターゲット:
+This pulls a prebuilt binary from GitHub Releases. Supported targets:
 `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` /
 `x86_64-apple-darwin` / `aarch64-apple-darwin` /
-`x86_64-pc-windows-msvc`
+`x86_64-pc-windows-msvc`.
 
-`cargo-binstall` が無い場合は先に: `cargo install cargo-binstall`
+If you don't have `cargo-binstall` yet: `cargo install cargo-binstall`.
 
-### ソースからビルド
+### Building from source
 
 ```sh
 cargo install --path .
@@ -33,75 +33,83 @@ cargo install --path .
 cargo build --release   # target/release/cless
 ```
 
-ソースビルドには C コンパイラが必要 (各 tree-sitter パーサが C で書かれているため。macOS: `xcode-select --install`、Ubuntu: `apt install build-essential`)。リリースビルドは約 10 MB。
+Building from source requires a C compiler because each tree-sitter parser is written in C
+(macOS: `xcode-select --install`, Ubuntu: `apt install build-essential`).
+The release binary is ~10 MB.
 
-## 使い方
+## Usage
 
 ```sh
 cless <file>
 ```
 
-### キーバインド
+### Keybindings
 
 ```
- 移動
-   j, ↓, ENTER, ^E, ^N       1 行下
-   k, ↑, ^Y, ^P               1 行上
-   SPACE, f, ^F, ^V, PgDn    1 画面下
-   b, ^B, PgUp                1 画面上
-   d, ^D                      半画面下
-   u, ^U                      半画面上
-   g, <, HOME                 先頭   ([N]g で N 行目)
-   G, >, END                  末尾   ([N]G で N 行目)
-   p, %                       [N] パーセント位置
-   ←, →                       横スクロール (半画面)
+ Movement
+   j, ↓, ENTER, ^E, ^N       one line down
+   k, ↑, ^Y, ^P               one line up
+   SPACE, f, ^F, ^V, PgDn    one window down
+   b, ^B, PgUp                one window up
+   d, ^D                      half-window down
+   u, ^U                      half-window up
+   g, <, HOME                 first line   ([N]g jumps to line N)
+   G, >, END                  last line    ([N]G jumps to line N)
+   p, %                       [N] percent into the file
+   ←, →                       horizontal half-screen scroll
 
- 検索
-   /pattern                   前方検索
-   ?pattern                   後方検索
-   n                          次のマッチ
-   N                          逆方向に次のマッチ
+ Searching
+   /pattern                   search forward
+   ?pattern                   search backward
+   n                          repeat last search
+   N                          repeat in the reverse direction
 
- その他
-   =, ^G                      現在位置を表示
-   r, R, ^L                   画面を再描画
-   h, H                       ヘルプ画面
-   q, Q, ZZ, ^C               終了
+ Other
+   =, ^G                      show current file position
+   r, R, ^L                   repaint the screen
+   h, H                       help screen
+   q, Q, ZZ, ^C               quit
 ```
 
-数字プレフィクス: ほぼ全ての移動キーで `5j` / `100G` / `30%` のように繰り返し回数や行番号を指定できる。
+Number prefix: most movement keys accept a repeat count or line number
+(e.g. `5j`, `100G`, `30%`).
 
-## ハイライトのカスタマイズ
+## Customising the palette
 
-色は `src/highlight.rs` 先頭の `FG_*` 定数で定義し、`color_for(name)` が tree-sitter のキャプチャ名 (`keyword`, `function`, `string`, ...) から色を選ぶ。差し替えはここを編集して再ビルド。
+Colors are defined as `FG_*` constants at the top of `src/highlight.rs`, and
+`color_for(name)` maps tree-sitter capture names (`keyword`, `function`,
+`string`, ...) to those colors. Edit and rebuild to change the theme.
 
-対応キャプチャ名は `HIGHLIGHT_NAMES` の 26 種で、tree-sitter / Neovim の標準命名規則に沿う。
+The 26 supported capture names live in `HIGHLIGHT_NAMES` and follow the
+standard tree-sitter / Neovim naming conventions.
 
-## アーキテクチャ
+## Architecture
 
-| ファイル | 役割 |
+| File | Role |
 | --- | --- |
-| `src/main.rs` | 引数処理とエラーハンドリング |
-| `src/highlight.rs` | 言語判定 + tree-sitter で `Vec<Line>` を構築 |
-| `src/pager.rs` | 端末制御 (crossterm)、入力ループ、検索、描画 |
-| `src/bin/dump.rs` | 非対話デバッグヘルパ。`dump <file> [pattern]` でハイライト ANSI / マッチ行を stdout に出す |
+| `src/main.rs` | Arg parsing and error handling |
+| `src/highlight.rs` | Language detection + tree-sitter; builds `Vec<Line>` |
+| `src/pager.rs` | Terminal control (crossterm), input loop, search, rendering |
+| `src/bin/dump.rs` | Non-interactive debug helper. `dump <file> [pattern]` prints highlighted ANSI / matching lines to stdout |
 
-## 制限
+## Limitations
 
-- stdin / パイプ入力には未対応 (ファイル引数のみ)
-- バイナリ / 非 UTF-8 ファイルは開けない
-- `F` (tail -f) 風モード、`m`/`'` マーク、`-N` 行番号表示、複数ファイル (`:n`) は未実装
-- テーマ切替フラグなし (色変更は再ビルドが必要)
+- No stdin / pipe input (file argument only)
+- Cannot open binary or non-UTF-8 files
+- Not implemented: `F` (tail -f mode), `m`/`'` marks, `-N` line numbers, multi-file (`:n`)
+- No theme-switch flag (color changes require a rebuild)
 
-## ライセンス
+## License
 
-MIT または Apache-2.0 のデュアルライセンス。利用者はどちらかを選択できる (Rust エコシステム標準)。
+Dual-licensed under MIT or Apache-2.0; users may choose either (Rust ecosystem standard).
 
 - [LICENSE-MIT](LICENSE-MIT)
 - [LICENSE-APACHE](LICENSE-APACHE)
 
-SPDX 識別子: `MIT OR Apache-2.0`
+SPDX identifier: `MIT OR Apache-2.0`
 
-### コントリビューション
+### Contributions
 
-明示的に別の表明をしない限り、本リポジトリへのコントリビューションは Apache-2.0 ライセンス条項に従って、上記のとおりデュアルライセンスで提供されたものとみなす (追加の条件は付帯しない)。
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this repository shall be dual-licensed as above, without any
+additional terms or conditions.

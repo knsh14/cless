@@ -1,81 +1,81 @@
 # CLAUDE.md
 
-`cless` は tree-sitter ベースのシンタックスハイライト付き less クローン。Rust 単一バイナリ (Cargo, edition 2024)。リリースビルド ~10 MB、C コンパイラ必要 (各 tree-sitter パーサが C で書かれている)。
+`cless` is a `less`-like terminal pager with tree-sitter syntax highlighting. Single Rust binary (Cargo, edition 2024). Release build is ~10 MB and requires a C compiler at build time (each tree-sitter parser is written in C).
 
-エンドユーザ向けには `cargo binstall cless` で GitHub Releases の prebuilt を引く運用にしている (`.github/workflows/release.yml` がタグ push で 5 ターゲットをビルドして公開)。
+End users install via `cargo binstall cless`, which pulls a prebuilt binary from GitHub Releases. `.github/workflows/release.yml` builds and publishes binaries for five targets on every `v*` tag push.
 
-## プロジェクト構造
+## Project layout
 
 ```
 src/
-  main.rs        エントリ。引数処理 → highlight → pager
-  highlight.rs   言語判定 + tree-sitter で Vec<Line> を構築
-  pager.rs       crossterm で raw mode、入力ループ、検索、描画
-  bin/dump.rs    非対話デバッグヘルパ。ANSI を stdout に流す
-.github/workflows/release.yml  タグ push で prebuilt をビルド・公開
+  main.rs        Entry point. Arg parsing → highlight → pager.
+  highlight.rs   Language detection + tree-sitter; builds Vec<Line>.
+  pager.rs       Terminal control (crossterm), input loop, search, rendering.
+  bin/dump.rs    Non-interactive debug helper. Streams ANSI to stdout.
+.github/workflows/release.yml  Builds and publishes prebuilt binaries on tag push.
 ```
 
-## 主要コマンド
+## Key commands
 
 ```sh
 cargo build                                       # debug
-cargo build --release                             # 初回は ~15 秒 (15 言語の C パーサをビルド)
-cargo test                                        # pager::tests に 3 件
-cargo run --bin dump -- src/main.rs               # ハイライト出力を目視確認
-cargo run --bin dump -- src/main.rs main          # マッチ行のみ列挙 (検索ロジック検証用)
+cargo build --release                             # first run ~15s (15 C parsers to compile)
+cargo test                                        # 3 tests in pager::tests
+cargo run --bin dump -- src/main.rs               # inspect highlight output
+cargo run --bin dump -- src/main.rs main          # list lines matching a pattern (search-logic check)
 ./target/release/cless <file>
 ```
 
-## リリース手順
+## Release procedure
 
 ```sh
-# 1. version を Cargo.toml で更新
-# 2. commit & tag
+# 1. Bump version in Cargo.toml
+# 2. Commit and tag
 git tag v0.1.0
 git push origin v0.1.0
-# 3. GitHub Actions が 5 ターゲットのバイナリをビルドして Releases にアップロード
-# 4. cargo binstall cless で取得可能になる
+# 3. GitHub Actions builds binaries for 5 targets and uploads them to Releases
+# 4. cargo binstall cless picks them up automatically
 ```
 
-## アーキテクチャの要点
+## Architecture notes
 
 ### `highlight.rs`
 
-- `detect_language(path, content)` — 拡張子 → 特殊ファイル名 (`.bashrc` 等) → shebang (`#!/usr/bin/env python` 等)
-- `build_config(lang)` — 各言語 crate の `LANGUAGE` / `HIGHLIGHTS_QUERY` / `INJECTIONS_QUERY` で `HighlightConfiguration` を生成し、`HIGHLIGHT_NAMES` (26 個) で `.configure()`
-- `highlight_file(content, path)` — `Highlighter::highlight` のイベントをスタックで追って、改行で span を切り `Vec<Line>` に変換
-- パレットは citruszest ([zootedb0t/citruszest.nvim](https://github.com/zootedb0t/citruszest.nvim))。`FG_*` 定数と `color_for(name)` で対応
+- `detect_language(path, content)` — extension → special filenames (`.bashrc` etc.) → shebang (`#!/usr/bin/env python` etc.)
+- `build_config(lang)` — pulls `LANGUAGE` / `HIGHLIGHTS_QUERY` / `INJECTIONS_QUERY` from each language crate, builds a `HighlightConfiguration`, calls `.configure()` with the 26 entries in `HIGHLIGHT_NAMES`
+- `highlight_file(content, path)` — walks the `Highlighter::highlight` event stream with a scope stack, splits spans on newlines, returns `Vec<Line>`
+- Palette is citruszest ([zootedb0t/citruszest.nvim](https://github.com/zootedb0t/citruszest.nvim)). Mapping lives in the `FG_*` constants and `color_for(name)`.
 
 ### `pager.rs`
 
-- `Pager` 構造体: `top`, `left`, `count`, `mode`, `search`, `message`, `cols`, `rows`
-- 状態機械: `Mode::Normal | SearchInput | Help`
-- 毎フレームでフル再描画 (差分描画なし)。各行 `Clear(ClearType::CurrentLine)` してから書く
-- `render_line` は `\x1b[0;7;38;2;R;G;Bm` 形式の完全 SGR を毎チャンクで吐く (古い端末でも反転確実)
-- 検索は `regex` クレート、smart-case (全小文字パターンなら `case_insensitive`)
-- `max_top = lines - body_rows`。less と同じく短いファイルでは検索しても画面は動かない (反転表示のみ)
+- `Pager` struct fields: `top`, `left`, `count`, `mode`, `search`, `message`, `cols`, `rows`
+- State machine: `Mode::Normal | SearchInput | Help`
+- Full redraw every frame (no diffing). Each row is cleared with `Clear(ClearType::CurrentLine)` before writing.
+- `render_line` emits a complete `\x1b[0;7;38;2;R;G;Bm`-form SGR per chunk so older terminals render inverse video reliably.
+- Search uses the `regex` crate with smart-case (`case_insensitive` when the pattern is all lowercase).
+- `max_top = lines - body_rows`; matches `less` behaviour — short files do not scroll on search, only the matches are highlighted.
 
-## 開発上の規約
+## Development conventions
 
-- **less 仕様に忠実に**。独自キーバインドは足さない (vim 流 `h`/`l` 移動は意図的に外した)
-- **エンドユーザの install 体験を壊さない**: 依存を増やすときは prebuilt 配布で C 依存を END USER から隠せるかを確認。`cargo binstall cless` で完結する状態を維持
-- 依存追加は事前に確認 (tree-sitter 言語の追加は OK、その他は要相談)
-- 色変更は `FG_*` 定数と `color_for` のみで完結する。テーマ切替フラグはまだない
-- コメントはなぜが非自明な時だけ書く
+- **Stay faithful to `less`**. Do not invent new keybindings (vim-style `h` / `l` motion was removed on purpose).
+- **Do not break end-user install UX**. Before adding a dependency, verify that any C/native dependency can be hidden behind the prebuilt-binary distribution so `cargo binstall cless` keeps working.
+- Confirm dependency additions in advance (adding tree-sitter languages is fine, anything else needs a chat).
+- Color changes should be confined to the `FG_*` constants and `color_for`. No theme-switch flag yet.
+- Comments only when the *why* is non-obvious.
 
-## 検証の進め方
+## Verification workflow
 
-raw mode が必要なため対話的なページャの動作は headless 環境では確認できない。代わりに:
+Raw mode is required, so the interactive pager cannot be exercised in a headless environment. Instead:
 
-- `cargo test` で `render_line` の SGR 出力をテスト
-- `cargo run --bin dump -- <file>` で ANSI 出力を目視 (パイプして `cat -v` でエスケープも見える)
-- 検索ロジックは `dump <file> <pattern>` でマッチ行が出るか確認
+- Run `cargo test` to cover the `render_line` SGR output.
+- Use `cargo run --bin dump -- <file>` to inspect the ANSI output (pipe through `cat -v` to see the escape sequences).
+- Verify search logic by running `dump <file> <pattern>` and checking the matching lines.
 
-## 未実装
+## Unimplemented
 
-- stdin パイプ入力
-- 行番号表示 (`-N`)
-- ファイル末尾追従 (`F`)
-- マーク (`m`/`'`)
-- 複数ファイル (`:n`)
-- テーマ切替フラグ / 設定ファイル
+- stdin / pipe input
+- Line numbers (`-N`)
+- Tail-follow mode (`F`)
+- Marks (`m` / `'`)
+- Multiple files (`:n`)
+- Theme-switch flag / configuration file
