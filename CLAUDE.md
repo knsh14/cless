@@ -11,7 +11,6 @@ src/
   main.rs        Entry point. Arg parsing → highlight → pager.
   highlight.rs   Language detection + tree-sitter; builds Vec<Line>.
   pager.rs       Terminal control (crossterm), input loop, search, rendering.
-  bin/dump.rs    Non-interactive debug helper. Streams ANSI to stdout.
 .github/workflows/release.yml  Builds and publishes prebuilt binaries on tag push.
 ```
 
@@ -21,8 +20,6 @@ src/
 cargo build                                       # debug
 cargo build --release                             # first run ~15s (15 C parsers to compile)
 cargo test                                        # 3 tests in pager::tests
-cargo run --bin dump -- src/main.rs               # inspect highlight output
-cargo run --bin dump -- src/main.rs main          # list lines matching a pattern (search-logic check)
 ./target/release/cless <file>
 ```
 
@@ -65,11 +62,7 @@ git push origin v0.1.0
 
 ## Verification workflow
 
-Raw mode is required, so the interactive pager cannot be exercised in a headless environment. Instead:
-
-- Run `cargo test` to cover the `render_line` SGR output.
-- Use `cargo run --bin dump -- <file>` to inspect the ANSI output (pipe through `cat -v` to see the escape sequences).
-- Verify search logic by running `dump <file> <pattern>` and checking the matching lines.
+Raw mode is required, so the interactive pager cannot be exercised in a headless environment. Run `cargo test` to cover the `render_line` SGR output. For visual / interactive checks, run the binary in a real terminal.
 
 ## Unimplemented
 

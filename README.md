@@ -90,7 +90,6 @@ standard tree-sitter / Neovim naming conventions.
 | `src/main.rs` | Arg parsing and error handling |
 | `src/highlight.rs` | Language detection + tree-sitter; builds `Vec<Line>` |
 | `src/pager.rs` | Terminal control (crossterm), input loop, search, rendering |
-| `src/bin/dump.rs` | Non-interactive debug helper. `dump <file> [pattern]` prints highlighted ANSI / matching lines to stdout |
 
 ## Limitations
 
