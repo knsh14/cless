@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 description = "A less-like terminal pager with tree-sitter syntax highlighting"
 repository = "https://github.com/knsh14/cless"
 readme = "README.md"
+keywords = ["less", "pager", "syntax-highlighting", "tree-sitter", "cli"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 crossterm = "0.28"
