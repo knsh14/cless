@@ -28,9 +28,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(path: &str, lines: &[Line]) -> io::Result<()> {
+pub fn run(path: &str, lines: &[Line], wrap: bool) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let mut pager = Pager::new(path, lines);
+    let mut pager = Pager::new(path, lines, wrap);
     pager.run()
 }
 
@@ -54,10 +54,15 @@ enum Mode {
 struct Pager<'a> {
     path: &'a str,
     lines: &'a [Line],
+    // Scroll position: first visible source line (`top`) and, when wrapping,
+    // the wrap-segment within it shown at the top of the screen (`sub`).
     top: usize,
+    sub: usize,
     left: usize,
+    wrap: bool,
     count: Option<usize>,
     pending_z: bool,
+    pending_dash: bool,
     mode: Mode,
     search: Option<SearchState>,
     message: Option<String>,
@@ -66,14 +71,17 @@ struct Pager<'a> {
 }
 
 impl<'a> Pager<'a> {
-    fn new(path: &'a str, lines: &'a [Line]) -> Self {
+    fn new(path: &'a str, lines: &'a [Line], wrap: bool) -> Self {
         Self {
             path,
             lines,
             top: 0,
+            sub: 0,
             left: 0,
+            wrap,
             count: None,
             pending_z: false,
+            pending_dash: false,
             mode: Mode::Normal,
             search: None,
             message: None,
@@ -86,12 +94,104 @@ impl<'a> Pager<'a> {
         self.rows.saturating_sub(1)
     }
 
-    fn max_top(&self) -> usize {
-        self.lines.len().saturating_sub(self.body_rows())
+    /// Number of screen rows the given source line occupies (always >= 1).
+    fn line_height(&self, idx: usize) -> usize {
+        line_height_of(&self.lines[idx], self.cols, self.wrap)
+    }
+
+    /// Last display row of the file: (last line, its last wrap segment).
+    fn end_pos(&self) -> (usize, usize) {
+        if self.lines.is_empty() {
+            return (0, 0);
+        }
+        let last = self.lines.len() - 1;
+        (last, self.line_height(last).saturating_sub(1))
+    }
+
+    /// Scroll position that puts the final screenful at the bottom — the wrap
+    /// analog of the old `max_top`. Short files stay at the top.
+    fn max_scroll(&self) -> (usize, usize) {
+        let body = self.body_rows().max(1);
+        let (t, s) = self.end_pos();
+        self.pos_up(t, s, body - 1)
+    }
+
+    /// Move a position down by `n` display rows, stopping at `end_pos`.
+    fn pos_down(&self, mut top: usize, mut sub: usize, n: usize) -> (usize, usize) {
+        for _ in 0..n {
+            if top >= self.lines.len() {
+                break;
+            }
+            if sub + 1 < self.line_height(top) {
+                sub += 1;
+            } else if top + 1 < self.lines.len() {
+                top += 1;
+                sub = 0;
+            } else {
+                break;
+            }
+        }
+        (top, sub)
+    }
+
+    /// Move a position up by `n` display rows, stopping at the very top.
+    fn pos_up(&self, mut top: usize, mut sub: usize, n: usize) -> (usize, usize) {
+        for _ in 0..n {
+            if sub > 0 {
+                sub -= 1;
+            } else if top > 0 {
+                top -= 1;
+                sub = self.line_height(top).saturating_sub(1);
+            } else {
+                break;
+            }
+        }
+        (top, sub)
+    }
+
+    fn scroll_down(&mut self, n: usize) {
+        let p = self.pos_down(self.top, self.sub, n).min(self.max_scroll());
+        (self.top, self.sub) = p;
+    }
+
+    fn scroll_up(&mut self, n: usize) {
+        (self.top, self.sub) = self.pos_up(self.top, self.sub, n);
+    }
+
+    /// Jump to the top of source line `line`, clamped into range.
+    fn goto_line(&mut self, line: usize) {
+        let p = clamp_pos(self.lines, self.cols, self.wrap, line, 0).min(self.max_scroll());
+        (self.top, self.sub) = p;
+    }
+
+    fn goto_end(&mut self) {
+        (self.top, self.sub) = self.max_scroll();
+    }
+
+    /// Source line index shown on the bottom body row.
+    fn bottom_line(&self) -> usize {
+        let body = self.body_rows().max(1);
+        self.pos_down(self.top, self.sub, body - 1).0
     }
 
     fn at_end(&self) -> bool {
-        self.top >= self.max_top()
+        (self.top, self.sub) >= self.max_scroll()
+    }
+
+    fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+        self.left = 0;
+        // Keep the current line in view; drop the sub-row offset.
+        let p = clamp_pos(self.lines, self.cols, self.wrap, self.top, 0).min(self.max_scroll());
+        (self.top, self.sub) = p;
+        self.message = Some(
+            if self.wrap {
+                "Wrap long lines"
+            } else {
+                "Chop long lines"
+            }
+            .to_string(),
+        );
     }
 
     fn run(&mut self) -> io::Result<()> {
@@ -99,8 +199,13 @@ impl<'a> Pager<'a> {
             let (c, r) = terminal::size()?;
             self.cols = c as usize;
             self.rows = r.max(2) as usize;
-            if self.top > self.max_top() {
-                self.top = self.max_top();
+            // Resize may shrink a line's wrap-segment count; guard `sub` first
+            // (avoids indexing past the end), then keep the end on-screen.
+            (self.top, self.sub) =
+                clamp_pos(self.lines, self.cols, self.wrap, self.top, self.sub);
+            let max = self.max_scroll();
+            if (self.top, self.sub) > max {
+                (self.top, self.sub) = max;
             }
             self.draw()?;
             match event::read()? {
@@ -139,8 +244,16 @@ impl<'a> Pager<'a> {
 
     fn handle_normal(&mut self, k: KeyEvent) -> bool {
         let body = self.body_rows().max(1);
-        let max = self.max_top();
         let count = self.count;
+
+        // `-S` option toggle (chop long lines), faithful to less's `-` prefix.
+        if std::mem::replace(&mut self.pending_dash, false) {
+            if let KeyCode::Char('S') = k.code {
+                self.toggle_wrap();
+                self.count = None;
+                return false;
+            }
+        }
 
         // Digit prefix.
         if let KeyCode::Char(c @ '0'..='9') = k.code {
@@ -173,14 +286,19 @@ impl<'a> Pager<'a> {
                 consume = false;
             }
 
+            // ---- Option toggle prefix (`-S` chops long lines)
+            (KeyCode::Char('-'), _) => {
+                self.pending_dash = true;
+                consume = false;
+            }
+
             // ---- Forward one line
             (KeyCode::Char('j'), KeyModifiers::NONE)
             | (KeyCode::Down, _)
             | (KeyCode::Enter, _)
             | (KeyCode::Char('e'), KeyModifiers::CONTROL)
             | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
-                let n = count.unwrap_or(1);
-                self.top = self.top.saturating_add(n).min(max);
+                self.scroll_down(count.unwrap_or(1));
             }
 
             // ---- Backward one line
@@ -188,8 +306,7 @@ impl<'a> Pager<'a> {
             | (KeyCode::Up, _)
             | (KeyCode::Char('y'), KeyModifiers::CONTROL)
             | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                let n = count.unwrap_or(1);
-                self.top = self.top.saturating_sub(n);
+                self.scroll_up(count.unwrap_or(1));
             }
 
             // ---- Forward one window
@@ -198,57 +315,60 @@ impl<'a> Pager<'a> {
             | (KeyCode::Char('f'), KeyModifiers::CONTROL)
             | (KeyCode::Char('v'), KeyModifiers::CONTROL)
             | (KeyCode::PageDown, _) => {
-                let n = count.unwrap_or(body);
-                self.top = self.top.saturating_add(n).min(max);
+                self.scroll_down(count.unwrap_or(body));
             }
 
             // ---- Backward one window
             (KeyCode::Char('b'), KeyModifiers::NONE)
             | (KeyCode::Char('b'), KeyModifiers::CONTROL)
             | (KeyCode::PageUp, _) => {
-                let n = count.unwrap_or(body);
-                self.top = self.top.saturating_sub(n);
+                self.scroll_up(count.unwrap_or(body));
             }
 
             // ---- Forward half-window
             (KeyCode::Char('d'), KeyModifiers::NONE)
             | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                let n = count.unwrap_or(body / 2).max(1);
-                self.top = self.top.saturating_add(n).min(max);
+                self.scroll_down(count.unwrap_or(body / 2).max(1));
             }
 
             // ---- Backward half-window
             (KeyCode::Char('u'), KeyModifiers::NONE)
             | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                let n = count.unwrap_or(body / 2).max(1);
-                self.top = self.top.saturating_sub(n);
+                self.scroll_up(count.unwrap_or(body / 2).max(1));
             }
 
             // ---- Go to line / top
             (KeyCode::Char('g'), KeyModifiers::NONE)
             | (KeyCode::Char('<'), _)
             | (KeyCode::Home, _) => {
-                self.top = count.map(|n| n.saturating_sub(1).min(max)).unwrap_or(0);
+                self.goto_line(count.map(|n| n.saturating_sub(1)).unwrap_or(0));
             }
 
             // ---- Go to line / bottom
             (KeyCode::Char('G'), _) | (KeyCode::Char('>'), _) | (KeyCode::End, _) => {
-                self.top = count.map(|n| n.saturating_sub(1).min(max)).unwrap_or(max);
+                match count {
+                    Some(n) => self.goto_line(n.saturating_sub(1)),
+                    None => self.goto_end(),
+                }
             }
 
             // ---- Percent of file
             (KeyCode::Char('p'), KeyModifiers::NONE) | (KeyCode::Char('%'), _) => {
                 let pct = count.unwrap_or(0).min(100);
                 let target = self.lines.len().saturating_mul(pct) / 100;
-                self.top = target.min(max);
+                self.goto_line(target);
             }
 
-            // ---- Horizontal scroll: half-screen
+            // ---- Horizontal scroll: half-screen (chop mode only; wrapping has no left)
             (KeyCode::Right, _) => {
-                self.left = self.left.saturating_add(self.cols.max(2) / 2);
+                if !self.wrap {
+                    self.left = self.left.saturating_add(self.cols.max(2) / 2);
+                }
             }
             (KeyCode::Left, _) => {
-                self.left = self.left.saturating_sub(self.cols.max(2) / 2);
+                if !self.wrap {
+                    self.left = self.left.saturating_sub(self.cols.max(2) / 2);
+                }
             }
 
             // ---- Search
@@ -396,7 +516,7 @@ impl<'a> Pager<'a> {
 
         match found {
             Some(i) => {
-                self.top = i.min(self.max_top());
+                self.goto_line(i);
             }
             None => {
                 self.message = Some("Pattern not found".to_string());
@@ -406,7 +526,7 @@ impl<'a> Pager<'a> {
 
     fn info_string(&self) -> String {
         let total = self.lines.len();
-        let last = (self.top + self.body_rows()).min(total);
+        let last = (self.bottom_line() + 1).min(total);
         let pct = if total == 0 {
             100
         } else {
@@ -431,17 +551,41 @@ impl<'a> Pager<'a> {
             return out.flush();
         }
 
+        let mut top = self.top;
+        let mut sub = self.sub;
+        // Wrap-segment byte ranges for the current source line (wrap mode only).
+        let mut ranges = if self.wrap && top < self.lines.len() {
+            wrap_ranges(&self.lines[top], self.cols)
+        } else {
+            Vec::new()
+        };
         for row in 0..body {
             queue!(
                 out,
                 cursor::MoveTo(0, row as u16),
                 Clear(ClearType::CurrentLine)
             )?;
-            let idx = self.top + row;
-            if idx < self.lines.len() {
-                let rendered =
-                    render_line(&self.lines[idx], self.left, self.cols, self.search.as_ref());
-                out.write_all(rendered.as_bytes())?;
+            if top < self.lines.len() {
+                if self.wrap {
+                    let range = ranges[sub.min(ranges.len() - 1)];
+                    let rendered =
+                        render_segment(&self.lines[top], range, self.search.as_ref());
+                    out.write_all(rendered.as_bytes())?;
+                    if sub + 1 < ranges.len() {
+                        sub += 1;
+                    } else {
+                        top += 1;
+                        sub = 0;
+                        if top < self.lines.len() {
+                            ranges = wrap_ranges(&self.lines[top], self.cols);
+                        }
+                    }
+                } else {
+                    let rendered =
+                        render_line(&self.lines[top], self.left, self.cols, self.search.as_ref());
+                    out.write_all(rendered.as_bytes())?;
+                    top += 1;
+                }
             } else {
                 out.write_all(b"\x1b[38;2;90;90;90m~\x1b[0m")?;
             }
@@ -493,7 +637,7 @@ impl<'a> Pager<'a> {
         if total == 0 {
             return format!(" {}  (empty)", self.path);
         }
-        let last = (self.top + self.body_rows()).min(total);
+        let last = (self.bottom_line() + 1).min(total);
         let pct = (last * 100 / total).min(100);
         if self.at_end() {
             format!(" {}  (END)  {}/{}  {}%", self.path, last, total, pct)
@@ -539,7 +683,7 @@ const HELP_TEXT: &str = "\
     g  <  HOME                     go to first line   ([N]g -> line N)
     G  >  END                      go to last line    ([N]G -> line N)
     p  %                           go to [N] percent into file
-    LEFT  RIGHT                    half-screen horizontal scroll
+    LEFT  RIGHT                    half-screen horizontal scroll (chop mode)
 
   SEARCHING
     /pattern                       search forward
@@ -549,11 +693,72 @@ const HELP_TEXT: &str = "\
                                    (smart-case: lower-only -> ignore case)
 
   OTHER
+    -S                             toggle wrap / chop long lines
     =  ^G                          show current file info
     r  R  ^L                       repaint screen
     h  H                           this help screen
     q  Q  ZZ  ^C                   quit
 ";
+
+/// Byte ranges `[start, end)` (over the concatenated span text) of each wrap
+/// segment for a line at the given width. The single source of truth for where
+/// wrapping breaks — `render_segment` renders these ranges and never re-decides.
+/// Always returns at least one range, so empty lines yield `[(0, 0)]`.
+fn wrap_ranges(line: &Line, cols: usize) -> Vec<(usize, usize)> {
+    let cols = cols.max(1);
+    let mut ranges = Vec::new();
+    let mut seg_start = 0usize;
+    let mut byte_pos = 0usize;
+    let mut col = 0usize;
+    for (_, text) in &line.spans {
+        for ch in text.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            // Break before a char that no longer fits, unless the row is empty
+            // (a single char wider than the screen still gets its own row).
+            if cw > 0 && col + cw > cols && col > 0 {
+                ranges.push((seg_start, byte_pos));
+                seg_start = byte_pos;
+                col = 0;
+            }
+            col += cw;
+            byte_pos += ch.len_utf8();
+        }
+    }
+    ranges.push((seg_start, byte_pos));
+    ranges
+}
+
+/// Screen rows a line occupies: 1 in chop mode, else its wrap-segment count.
+fn line_height_of(line: &Line, cols: usize, wrap: bool) -> usize {
+    if wrap {
+        wrap_ranges(line, cols).len()
+    } else {
+        1
+    }
+}
+
+/// Clamp a scroll position into range: a valid line and a valid wrap-segment
+/// within it. Guards against `sub` pointing past a line's segments after a
+/// resize widens the screen (which would otherwise index out of bounds).
+fn clamp_pos(
+    lines: &[Line],
+    cols: usize,
+    wrap: bool,
+    mut top: usize,
+    mut sub: usize,
+) -> (usize, usize) {
+    if lines.is_empty() {
+        return (0, 0);
+    }
+    if top >= lines.len() {
+        top = lines.len() - 1;
+    }
+    let h = line_height_of(&lines[top], cols, wrap);
+    if sub >= h {
+        sub = h - 1;
+    }
+    (top, sub)
+}
 
 fn line_plain(line: &Line) -> String {
     let mut s = String::new();
@@ -634,6 +839,124 @@ mod tests {
         let n = rendered.matches("\x1b[0;7;").count();
         assert!(n >= 2, "expected >=2 inverse SGR, got {} in {:?}", n, rendered);
     }
+
+    #[test]
+    fn wrap_exact_fit_is_one_segment() {
+        let l = line("abcde"); // width 5
+        assert_eq!(wrap_ranges(&l, 5), vec![(0, 5)]);
+    }
+
+    #[test]
+    fn wrap_overflow_breaks() {
+        let l = line("abcdef"); // width 6, cols 5 -> "abcde" + "f"
+        assert_eq!(wrap_ranges(&l, 5), vec![(0, 5), (5, 6)]);
+    }
+
+    #[test]
+    fn wrap_empty_line_is_single_segment() {
+        let l = line("");
+        assert_eq!(wrap_ranges(&l, 5), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn wrap_wide_char_straddling_boundary() {
+        // "aあb": 'a'=w1/1B, 'あ'=w2/3B, 'b'=w1/1B. cols=2.
+        // row0: 'a' (col1), 'あ' would make col3>2 -> break -> (0,1).
+        // row1: 'あ' (col2), 'b' would make col3>2 -> break -> (1,4).
+        // row2: 'b' -> (4,5).
+        let l = line("aあb");
+        assert_eq!(wrap_ranges(&l, 2), vec![(0, 1), (1, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn wrap_zero_width_char_stays_in_segment() {
+        // Tabs report width 0 and must not force a wrap break.
+        let l = line("a\tb"); // widths 1,0,1 -> fits in cols 2 as one segment
+        assert_eq!(wrap_ranges(&l, 2), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn wrap_char_wider_than_screen_gets_own_row() {
+        // cols=1 but 'あ' is width 2: it occupies its own row rather than
+        // producing an empty leading segment.
+        let l = line("あい");
+        assert_eq!(wrap_ranges(&l, 1), vec![(0, 3), (3, 6)]);
+    }
+
+    #[test]
+    fn clamp_pos_guards_sub_overflow() {
+        // Line wraps to 2 segments at cols 5; a stale sub=9 (e.g. after a
+        // resize widened the screen) clamps to the last valid segment.
+        let lines = vec![line("abcdef")];
+        assert_eq!(clamp_pos(&lines, 5, true, 0, 9), (0, 1));
+        // After widening to cols 10 it is a single segment: sub clamps to 0.
+        assert_eq!(clamp_pos(&lines, 10, true, 0, 9), (0, 0));
+    }
+
+    #[test]
+    fn clamp_pos_chop_mode_sub_is_zero() {
+        let lines = vec![line("abcdef")];
+        assert_eq!(clamp_pos(&lines, 5, false, 0, 3), (0, 0));
+    }
+
+    #[test]
+    fn clamp_pos_clamps_top_to_last_line() {
+        let lines = vec![line("a"), line("b")];
+        assert_eq!(clamp_pos(&lines, 5, true, 9, 0), (1, 0));
+    }
+
+    #[test]
+    fn clamp_pos_empty_file() {
+        let lines: Vec<Line> = Vec::new();
+        assert_eq!(clamp_pos(&lines, 5, true, 3, 2), (0, 0));
+    }
+}
+
+/// Render one wrap segment (a byte range from `wrap_ranges`) of a line, with
+/// syntax colors and search-match inverse video, terminated by a reset.
+fn render_segment(line: &Line, range: (usize, usize), search: Option<&SearchState>) -> String {
+    let (start, end) = range;
+    let plain = line_plain(line);
+    let matches: Vec<(usize, usize)> = if let Some(s) = search {
+        s.re
+            .find_iter(&plain)
+            .map(|m| (m.start(), m.end()))
+            .filter(|(a, b)| b > a)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let in_match = |byte: usize| matches.iter().any(|&(a, b)| byte >= a && byte < b);
+
+    let mut out = String::new();
+    let mut byte_pos: usize = 0;
+    let mut prev_sgr: Option<String> = None;
+    let mut any_emitted = false;
+
+    for (style, text) in &line.spans {
+        let fg = style.foreground;
+        for ch in text.chars() {
+            let ch_len = ch.len_utf8();
+            if byte_pos >= start && byte_pos < end && UnicodeWidthChar::width(ch).unwrap_or(0) > 0 {
+                let sgr = if in_match(byte_pos) {
+                    format!("\x1b[0;7;38;2;{};{};{}m", fg.r, fg.g, fg.b)
+                } else {
+                    format!("\x1b[0;38;2;{};{};{}m", fg.r, fg.g, fg.b)
+                };
+                if prev_sgr.as_deref() != Some(sgr.as_str()) {
+                    out.push_str(&sgr);
+                    prev_sgr = Some(sgr);
+                }
+                out.push(ch);
+                any_emitted = true;
+            }
+            byte_pos += ch_len;
+        }
+    }
+    if any_emitted {
+        out.push_str("\x1b[0m");
+    }
+    out
 }
 
 fn render_line(line: &Line, left: usize, cols: usize, search: Option<&SearchState>) -> String {

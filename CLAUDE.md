@@ -19,8 +19,8 @@ src/
 ```sh
 cargo build                                       # debug
 cargo build --release                             # first run ~15s (15 C parsers to compile)
-cargo test                                        # 3 tests in pager::tests
-./target/release/cless <file>
+cargo test                                        # pager::tests (render SGR, wrap_ranges, clamp_pos)
+./target/release/cless <file>                     # wraps long lines; -S to chop instead
 ```
 
 ## Release procedure
@@ -45,12 +45,13 @@ git push origin v0.1.0
 
 ### `pager.rs`
 
-- `Pager` struct fields: `top`, `left`, `count`, `mode`, `search`, `message`, `cols`, `rows`
+- `Pager` struct fields: `top`, `sub`, `left`, `wrap`, `count`, `pending_z`, `pending_dash`, `mode`, `search`, `message`, `cols`, `rows`
 - State machine: `Mode::Normal | SearchInput | Help`
 - Full redraw every frame (no diffing). Each row is cleared with `Clear(ClearType::CurrentLine)` before writing.
 - `render_line` emits a complete `\x1b[0;7;38;2;R;G;Bm`-form SGR per chunk so older terminals render inverse video reliably.
 - Search uses the `regex` crate with smart-case (`case_insensitive` when the pattern is all lowercase).
-- `max_top = lines - body_rows`; matches `less` behaviour — short files do not scroll on search, only the matches are highlighted.
+- **Line wrapping (`wrap` field)** — on by default, like `less`; `-S` (flag or the `-S` key) chops long lines instead. Scroll position is `(top, sub)`: source line `top`, plus the wrap-segment `sub` at the top of the screen (`sub` is always 0 in chop mode). `wrap_ranges(line, cols)` is the single source of truth for where a line breaks (returns byte ranges over the concatenated span text); `render_segment` renders one such range and never re-decides the break. Navigation (`j`/`k`/page/half) moves by *display* rows via `pos_down`/`pos_up`; `g`/`G`/`%`/search jump to a logical line (`sub = 0`). Horizontal scroll (`left`, ←/→) is chop-mode only.
+- `max_scroll()` is the wrap-aware analog of the old `max_top` — the position that puts the final screenful at the bottom; short files stay at the top (matches `less`: they do not scroll on search, only matches are highlighted). `clamp_pos` (pure, unit-tested) guards `sub` against pointing past a line's segment count after a resize widens the screen.
 
 ## Development conventions
 
