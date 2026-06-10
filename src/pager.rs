@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Write, stdout};
 
 use crossterm::{
@@ -10,7 +11,35 @@ use crossterm::{
 use regex::{Regex, RegexBuilder};
 use unicode_width::UnicodeWidthChar;
 
-use crate::highlight::Line;
+use crate::highlight::{Line, highlight_file};
+
+/// An input the pager can display. Files are read and highlighted lazily on
+/// switch; stdin content is pre-highlighted (it cannot be re-read).
+pub struct Source {
+    name: String,
+    kind: SourceKind,
+}
+
+enum SourceKind {
+    File(String),
+    Memory(Vec<Line>),
+}
+
+impl Source {
+    pub fn file(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Source {
+            name: name.into(),
+            kind: SourceKind::File(path.into()),
+        }
+    }
+
+    pub fn memory(name: impl Into<String>, lines: Vec<Line>) -> Self {
+        Source {
+            name: name.into(),
+            kind: SourceKind::Memory(lines),
+        }
+    }
+}
 
 struct TerminalGuard;
 
@@ -29,9 +58,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(name: String, lines: Vec<Line>, wrap: bool, numbers: bool) -> io::Result<()> {
+pub fn run(sources: Vec<Source>, wrap: bool, numbers: bool) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let mut pager = Pager::new(name, lines, wrap, numbers);
+    let mut pager = Pager::new(sources, wrap, numbers)?;
     pager.run()
 }
 
@@ -61,9 +90,12 @@ enum Pending {
     Dash,  // saw `-`, waiting for an option letter (S/N)
     Mark,  // saw `m`, waiting for a letter to name the mark
     Quote, // saw `'`, waiting for a letter to jump to a mark
+    Colon, // saw `:`, waiting for a file command (n/p)
 }
 
 struct Pager {
+    sources: Vec<Source>,
+    index: usize,
     name: String,
     lines: Vec<Line>,
     // Scroll position: first visible source line (`top`) and, when wrapping,
@@ -85,10 +117,12 @@ struct Pager {
 }
 
 impl Pager {
-    fn new(name: String, lines: Vec<Line>, wrap: bool, numbers: bool) -> Self {
-        Self {
-            name,
-            lines,
+    fn new(sources: Vec<Source>, wrap: bool, numbers: bool) -> io::Result<Self> {
+        let mut pager = Self {
+            sources,
+            index: 0,
+            name: String::new(),
+            lines: Vec::new(),
             top: 0,
             sub: 0,
             left: 0,
@@ -103,6 +137,56 @@ impl Pager {
             message: None,
             cols: 80,
             rows: 24,
+        };
+        pager.load(0)?;
+        Ok(pager)
+    }
+
+    /// Read and highlight source `index`, resetting view state and marks.
+    /// Errors propagate (the initial load aborts); switches handle them.
+    fn load(&mut self, index: usize) -> io::Result<()> {
+        let lines = match &self.sources[index].kind {
+            SourceKind::Memory(l) => l.to_vec(),
+            SourceKind::File(path) => {
+                let content = fs::read_to_string(path)?;
+                highlight_file(&content, path)
+            }
+        };
+        self.index = index;
+        self.name = self.sources[index].name.clone();
+        self.lines = lines;
+        self.top = 0;
+        self.sub = 0;
+        self.left = 0;
+        self.marks.clear();
+        self.prev_pos = None;
+        Ok(())
+    }
+
+    fn switch_file(&mut self, index: usize) {
+        match self.load(index) {
+            // read_to_string fails before mutating self, so state stays valid.
+            Err(e) => self.message = Some(format!("{}: {}", self.sources[index].name, e)),
+            Ok(()) => {
+                self.message =
+                    Some(format!("{} (file {}/{})", self.name, index + 1, self.sources.len()))
+            }
+        }
+    }
+
+    fn next_file(&mut self) {
+        if self.index + 1 < self.sources.len() {
+            self.switch_file(self.index + 1);
+        } else {
+            self.message = Some("No next file".to_string());
+        }
+    }
+
+    fn prev_file(&mut self) {
+        if self.index > 0 {
+            self.switch_file(self.index - 1);
+        } else {
+            self.message = Some("No previous file".to_string());
         }
     }
 
@@ -336,6 +420,17 @@ impl Pager {
                 self.count = None;
                 return false;
             }
+            // `:n` / `:p` switch between multiple files.
+            (Pending::Colon, KeyCode::Char('n')) => {
+                self.next_file();
+                self.count = None;
+                return false;
+            }
+            (Pending::Colon, KeyCode::Char('p')) => {
+                self.prev_file();
+                self.count = None;
+                return false;
+            }
             _ => {}
         }
 
@@ -383,6 +478,12 @@ impl Pager {
             }
             (KeyCode::Char('\''), _) => {
                 self.pending = Pending::Quote;
+                consume = false;
+            }
+
+            // ---- Multiple files: `:n` next, `:p` previous
+            (KeyCode::Char(':'), _) => {
+                self.pending = Pending::Colon;
                 consume = false;
             }
 
@@ -734,16 +835,21 @@ impl Pager {
     }
 
     fn status_string(&self) -> String {
+        let files = if self.sources.len() > 1 {
+            format!(" (file {}/{})", self.index + 1, self.sources.len())
+        } else {
+            String::new()
+        };
         let total = self.lines.len();
         if total == 0 {
-            return format!(" {}  (empty)", self.name);
+            return format!(" {}{}  (empty)", self.name, files);
         }
         let last = (self.bottom_line() + 1).min(total);
         let pct = (last * 100 / total).min(100);
         if self.at_end() {
-            format!(" {}  (END)  {}/{}  {}%", self.name, last, total, pct)
+            format!(" {}{}  (END)  {}/{}  {}%", self.name, files, last, total, pct)
         } else {
-            format!(" {}  {}/{}  {}%", self.name, last, total, pct)
+            format!(" {}{}  {}/{}  {}%", self.name, files, last, total, pct)
         }
     }
 
@@ -790,6 +896,10 @@ const HELP_TEXT: &str = "\
     m<letter>                      set mark at current position
     '<letter>                      jump to mark
     ''                             jump to previous position
+
+  FILES
+    :n                             next file
+    :p                             previous file
 
   SEARCHING
     /pattern                       search forward
@@ -1087,7 +1197,7 @@ mod tests {
 
     fn pager_with(n: usize) -> Pager {
         let lines: Vec<Line> = (0..n).map(|i| line(&format!("line {}", i))).collect();
-        let mut p = Pager::new("t".to_string(), lines, false, false);
+        let mut p = Pager::new(vec![Source::memory("t", lines)], false, false).unwrap();
         p.cols = 80;
         p.rows = 24;
         p
@@ -1121,6 +1231,28 @@ mod tests {
         p.goto_mark('z');
         assert!(p.message.is_some());
         assert_eq!(p.top, 0);
+    }
+
+    #[test]
+    fn switch_between_files_resets_view() {
+        let a: Vec<Line> = (0..10).map(|i| line(&format!("a{}", i))).collect();
+        let b: Vec<Line> = (0..5).map(|i| line(&format!("b{}", i))).collect();
+        let mut p =
+            Pager::new(vec![Source::memory("a", a), Source::memory("b", b)], false, false).unwrap();
+        p.cols = 80;
+        p.rows = 24;
+        assert_eq!((p.index, p.lines.len()), (0, 10));
+
+        p.goto_line(5);
+        p.next_file();
+        assert_eq!((p.index, p.lines.len()), (1, 5));
+        assert_eq!(p.top, 0); // view reset on switch
+
+        p.next_file(); // already last
+        assert_eq!(p.index, 1);
+
+        p.prev_file();
+        assert_eq!((p.index, p.lines.len()), (0, 10));
     }
 }
 

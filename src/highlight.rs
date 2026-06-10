@@ -14,6 +14,7 @@ pub struct Style {
     pub foreground: Color,
 }
 
+#[derive(Clone)]
 pub struct Line {
     pub spans: Vec<(Style, String)>,
 }
