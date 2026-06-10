@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write, stdout};
+use std::time::Duration;
 
 use crossterm::{
     cursor,
@@ -105,6 +106,8 @@ struct Pager {
     left: usize,
     wrap: bool,
     numbers: bool,
+    following: bool,
+    follow_len: u64,
     count: Option<usize>,
     pending: Pending,
     marks: HashMap<char, (usize, usize)>,
@@ -128,6 +131,8 @@ impl Pager {
             left: 0,
             wrap,
             numbers,
+            following: false,
+            follow_len: 0,
             count: None,
             pending: Pending::None,
             marks: HashMap::new(),
@@ -160,6 +165,7 @@ impl Pager {
         self.left = 0;
         self.marks.clear();
         self.prev_pos = None;
+        self.following = false;
         Ok(())
     }
 
@@ -343,30 +349,101 @@ impl Pager {
         );
     }
 
-    fn run(&mut self) -> io::Result<()> {
-        loop {
-            let (c, r) = terminal::size()?;
-            self.cols = c as usize;
-            self.rows = r.max(2) as usize;
-            // Resize may shrink a line's wrap-segment count; guard `sub` first
-            // (avoids indexing past the end), then keep the end on-screen.
-            (self.top, self.sub) =
-                clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, self.sub);
-            let max = self.max_scroll();
-            if (self.top, self.sub) > max {
-                (self.top, self.sub) = max;
-            }
-            self.draw()?;
-            match event::read()? {
-                Event::Key(k) if k.kind != KeyEventKind::Release => {
-                    if self.handle_key(k) {
-                        break;
-                    }
-                }
-                _ => {}
-            }
+    /// Pick up the current terminal size and re-clamp the scroll position.
+    fn refresh_size(&mut self) -> io::Result<()> {
+        let (c, r) = terminal::size()?;
+        self.cols = c as usize;
+        self.rows = r.max(2) as usize;
+        // Resize may shrink a line's wrap-segment count; guard `sub` first
+        // (avoids indexing past the end), then keep the end on-screen.
+        (self.top, self.sub) =
+            clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, self.sub);
+        let max = self.max_scroll();
+        if (self.top, self.sub) > max {
+            (self.top, self.sub) = max;
         }
         Ok(())
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        self.refresh_size()?;
+        self.draw()?;
+        loop {
+            // Redraw only after something changes (input, resize, or — while
+            // following — new data), so an idle follow doesn't flicker.
+            if self.following {
+                if event::poll(Duration::from_millis(300))? {
+                    match event::read()? {
+                        // Any key stops following.
+                        Event::Key(k) if k.kind != KeyEventKind::Release => {
+                            self.following = false;
+                            self.message = Some("Stopped following".to_string());
+                        }
+                        Event::Resize(..) => {}
+                        _ => continue,
+                    }
+                } else if !self.poll_growth()? {
+                    continue;
+                }
+            } else {
+                match event::read()? {
+                    Event::Key(k) if k.kind != KeyEventKind::Release => {
+                        if self.handle_key(k) {
+                            break;
+                        }
+                    }
+                    Event::Resize(..) => {}
+                    _ => continue,
+                }
+            }
+            self.refresh_size()?;
+            self.draw()?;
+        }
+        Ok(())
+    }
+
+    /// `F`: tail-follow the current file (stdin can't be re-read).
+    fn start_follow(&mut self) {
+        let path = match &self.sources[self.index].kind {
+            SourceKind::File(p) => p.clone(),
+            SourceKind::Memory(_) => {
+                self.message = Some("Cannot follow stdin".to_string());
+                return;
+            }
+        };
+        self.follow_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.following = true;
+        self.goto_end();
+        self.message = Some("Waiting for data... (any key to stop)".to_string());
+    }
+
+    /// While following, reload + re-highlight the file when its size changes
+    /// and jump to the end. Returns whether the screen needs a redraw.
+    fn poll_growth(&mut self) -> io::Result<bool> {
+        let path = match &self.sources[self.index].kind {
+            SourceKind::File(p) => p.clone(),
+            SourceKind::Memory(_) => return Ok(false),
+        };
+        let len = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => return Ok(false),
+        };
+        if len == self.follow_len {
+            return Ok(false);
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                self.lines = highlight_file(&content, &path);
+                self.follow_len = len;
+                self.goto_end();
+                Ok(true)
+            }
+            Err(_) => {
+                self.following = false;
+                self.message = Some("File no longer readable".to_string());
+                Ok(true)
+            }
+        }
     }
 
     fn handle_key(&mut self, k: KeyEvent) -> bool {
@@ -486,6 +563,9 @@ impl Pager {
                 self.pending = Pending::Colon;
                 consume = false;
             }
+
+            // ---- Tail-follow (like tail -f)
+            (KeyCode::Char('F'), _) => self.start_follow(),
 
             // ---- Forward one line
             (KeyCode::Char('j'), KeyModifiers::NONE)
@@ -900,6 +980,7 @@ const HELP_TEXT: &str = "\
   FILES
     :n                             next file
     :p                             previous file
+    F                              follow file (tail -f); any key stops
 
   SEARCHING
     /pattern                       search forward
@@ -1253,6 +1334,34 @@ mod tests {
 
         p.prev_file();
         assert_eq!((p.index, p.lines.len()), (0, 10));
+    }
+
+    #[test]
+    fn follow_reloads_on_growth() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!("cless_follow_{}.txt", std::process::id()));
+        std::fs::write(&path, "line1\n").unwrap();
+
+        let mut p =
+            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false).unwrap();
+        p.cols = 80;
+        p.rows = 24;
+        let n0 = p.lines.len();
+        p.follow_len = std::fs::metadata(&path).unwrap().len();
+        p.following = true;
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "line2").unwrap();
+        writeln!(f, "line3").unwrap();
+        drop(f);
+
+        assert!(p.poll_growth().unwrap(), "growth should trigger reload");
+        assert!(p.lines.len() > n0, "reloaded file should have more lines");
+
+        // No further change => no redraw requested.
+        assert!(!p.poll_growth().unwrap());
+
+        std::fs::remove_file(&path).ok();
     }
 }
 
