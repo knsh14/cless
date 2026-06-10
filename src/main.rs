@@ -45,7 +45,7 @@ fn main() -> ExitCode {
 
     let lines = highlight::highlight_file(&content, path);
 
-    if let Err(e) = pager::run(path, &lines, wrap) {
+    if let Err(e) = pager::run(path.to_string(), lines, wrap) {
         eprintln!("cless: {}", e);
         return ExitCode::from(1);
     }

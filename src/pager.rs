@@ -28,9 +28,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(path: &str, lines: &[Line], wrap: bool) -> io::Result<()> {
+pub fn run(name: String, lines: Vec<Line>, wrap: bool) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let mut pager = Pager::new(path, lines, wrap);
+    let mut pager = Pager::new(name, lines, wrap);
     pager.run()
 }
 
@@ -51,9 +51,9 @@ enum Mode {
     Help,
 }
 
-struct Pager<'a> {
-    path: &'a str,
-    lines: &'a [Line],
+struct Pager {
+    name: String,
+    lines: Vec<Line>,
     // Scroll position: first visible source line (`top`) and, when wrapping,
     // the wrap-segment within it shown at the top of the screen (`sub`).
     top: usize,
@@ -70,10 +70,10 @@ struct Pager<'a> {
     rows: usize,
 }
 
-impl<'a> Pager<'a> {
-    fn new(path: &'a str, lines: &'a [Line], wrap: bool) -> Self {
+impl Pager {
+    fn new(name: String, lines: Vec<Line>, wrap: bool) -> Self {
         Self {
-            path,
+            name,
             lines,
             top: 0,
             sub: 0,
@@ -160,7 +160,7 @@ impl<'a> Pager<'a> {
 
     /// Jump to the top of source line `line`, clamped into range.
     fn goto_line(&mut self, line: usize) {
-        let p = clamp_pos(self.lines, self.cols, self.wrap, line, 0).min(self.max_scroll());
+        let p = clamp_pos(&self.lines, self.cols, self.wrap, line, 0).min(self.max_scroll());
         (self.top, self.sub) = p;
     }
 
@@ -182,7 +182,7 @@ impl<'a> Pager<'a> {
         self.wrap = !self.wrap;
         self.left = 0;
         // Keep the current line in view; drop the sub-row offset.
-        let p = clamp_pos(self.lines, self.cols, self.wrap, self.top, 0).min(self.max_scroll());
+        let p = clamp_pos(&self.lines, self.cols, self.wrap, self.top, 0).min(self.max_scroll());
         (self.top, self.sub) = p;
         self.message = Some(
             if self.wrap {
@@ -202,7 +202,7 @@ impl<'a> Pager<'a> {
             // Resize may shrink a line's wrap-segment count; guard `sub` first
             // (avoids indexing past the end), then keep the end on-screen.
             (self.top, self.sub) =
-                clamp_pos(self.lines, self.cols, self.wrap, self.top, self.sub);
+                clamp_pos(&self.lines, self.cols, self.wrap, self.top, self.sub);
             let max = self.max_scroll();
             if (self.top, self.sub) > max {
                 (self.top, self.sub) = max;
@@ -534,7 +534,7 @@ impl<'a> Pager<'a> {
         };
         format!(
             "{}  lines {}-{}/{}  {}%",
-            self.path,
+            self.name,
             self.top + 1,
             last.max(self.top + 1),
             total,
@@ -635,14 +635,14 @@ impl<'a> Pager<'a> {
     fn status_string(&self) -> String {
         let total = self.lines.len();
         if total == 0 {
-            return format!(" {}  (empty)", self.path);
+            return format!(" {}  (empty)", self.name);
         }
         let last = (self.bottom_line() + 1).min(total);
         let pct = (last * 100 / total).min(100);
         if self.at_end() {
-            format!(" {}  (END)  {}/{}  {}%", self.path, last, total, pct)
+            format!(" {}  (END)  {}/{}  {}%", self.name, last, total, pct)
         } else {
-            format!(" {}  {}/{}  {}%", self.path, last, total, pct)
+            format!(" {}  {}/{}  {}%", self.name, last, total, pct)
         }
     }
 
