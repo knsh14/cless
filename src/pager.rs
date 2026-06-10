@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write, stdout};
 
 use crossterm::{
@@ -51,6 +52,17 @@ enum Mode {
     Help,
 }
 
+/// A keystroke that expects a follow-up key. Replaces a pile of parallel
+/// booleans so two prefixes can never be live at once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    None,
+    Z,     // saw `Z`, waiting for a second `Z` to quit (ZZ)
+    Dash,  // saw `-`, waiting for an option letter (S/N)
+    Mark,  // saw `m`, waiting for a letter to name the mark
+    Quote, // saw `'`, waiting for a letter to jump to a mark
+}
+
 struct Pager {
     name: String,
     lines: Vec<Line>,
@@ -62,8 +74,9 @@ struct Pager {
     wrap: bool,
     numbers: bool,
     count: Option<usize>,
-    pending_z: bool,
-    pending_dash: bool,
+    pending: Pending,
+    marks: HashMap<char, (usize, usize)>,
+    prev_pos: Option<(usize, usize)>,
     mode: Mode,
     search: Option<SearchState>,
     message: Option<String>,
@@ -82,8 +95,9 @@ impl Pager {
             wrap,
             numbers,
             count: None,
-            pending_z: false,
-            pending_dash: false,
+            pending: Pending::None,
+            marks: HashMap::new(),
+            prev_pos: None,
             mode: Mode::Normal,
             search: None,
             message: None,
@@ -181,6 +195,28 @@ impl Pager {
         (self.top, self.sub) = self.max_scroll();
     }
 
+    /// Jump to a saved position, remembering the current one for `''`.
+    fn jump_to(&mut self, pos: (usize, usize)) {
+        let cur = (self.top, self.sub);
+        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, pos.0, pos.1)
+            .min(self.max_scroll());
+        self.prev_pos = Some(cur);
+        (self.top, self.sub) = p;
+    }
+
+    fn goto_mark(&mut self, c: char) {
+        // `''` returns to the position before the last jump.
+        let target = if c == '\'' {
+            self.prev_pos
+        } else {
+            self.marks.get(&c).copied()
+        };
+        match target {
+            Some(pos) => self.jump_to(pos),
+            None => self.message = Some("Mark not set".to_string()),
+        }
+    }
+
     /// Source line index shown on the bottom body row.
     fn bottom_line(&self) -> usize {
         let body = self.body_rows().max(1);
@@ -250,9 +286,6 @@ impl Pager {
     }
 
     fn handle_key(&mut self, k: KeyEvent) -> bool {
-        if !matches!(k.code, KeyCode::Char('Z')) {
-            self.pending_z = false;
-        }
         // Any keypress clears a transient message except while in search input.
         if !matches!(self.mode, Mode::SearchInput { .. }) {
             self.message = None;
@@ -275,21 +308,35 @@ impl Pager {
         let body = self.body_rows().max(1);
         let count = self.count;
 
-        // Option toggle prefix `-` (less style): `-S` chops, `-N` numbers.
-        if std::mem::replace(&mut self.pending_dash, false) {
-            match k.code {
-                KeyCode::Char('S') => {
-                    self.toggle_wrap();
-                    self.count = None;
-                    return false;
-                }
-                KeyCode::Char('N') => {
-                    self.toggle_numbers();
-                    self.count = None;
-                    return false;
-                }
-                _ => {}
+        // Resolve a pending prefix key, if any. Unhandled combinations fall
+        // through so the second key is processed normally (matches less, e.g.
+        // `Z` then a non-`Z` key).
+        let pending = std::mem::replace(&mut self.pending, Pending::None);
+        match (pending, k.code) {
+            // `-S` chop long lines, `-N` line numbers.
+            (Pending::Dash, KeyCode::Char('S')) => {
+                self.toggle_wrap();
+                self.count = None;
+                return false;
             }
+            (Pending::Dash, KeyCode::Char('N')) => {
+                self.toggle_numbers();
+                self.count = None;
+                return false;
+            }
+            // `m<char>` sets a mark at the current position.
+            (Pending::Mark, KeyCode::Char(c)) if c.is_ascii_alphanumeric() => {
+                self.marks.insert(c, (self.top, self.sub));
+                self.count = None;
+                return false;
+            }
+            // `'<char>` jumps to a mark; `''` returns to the previous position.
+            (Pending::Quote, KeyCode::Char(c)) => {
+                self.goto_mark(c);
+                self.count = None;
+                return false;
+            }
+            _ => {}
         }
 
         // Digit prefix.
@@ -316,16 +363,26 @@ impl Pager {
             | (KeyCode::Char('Q'), KeyModifiers::SHIFT) => return true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
             (KeyCode::Char('Z'), _) => {
-                if self.pending_z {
+                if pending == Pending::Z {
                     return true;
                 }
-                self.pending_z = true;
+                self.pending = Pending::Z;
                 consume = false;
             }
 
-            // ---- Option toggle prefix (`-S` chops long lines)
+            // ---- Option toggle prefix (`-S` chops, `-N` numbers)
             (KeyCode::Char('-'), _) => {
-                self.pending_dash = true;
+                self.pending = Pending::Dash;
+                consume = false;
+            }
+
+            // ---- Marks: `m<char>` set, `'<char>` jump, `''` previous position
+            (KeyCode::Char('m'), KeyModifiers::NONE) => {
+                self.pending = Pending::Mark;
+                consume = false;
+            }
+            (KeyCode::Char('\''), _) => {
+                self.pending = Pending::Quote;
                 consume = false;
             }
 
@@ -729,6 +786,11 @@ const HELP_TEXT: &str = "\
     p  %                           go to [N] percent into file
     LEFT  RIGHT                    half-screen horizontal scroll (chop mode)
 
+  MARKS
+    m<letter>                      set mark at current position
+    '<letter>                      jump to mark
+    ''                             jump to previous position
+
   SEARCHING
     /pattern                       search forward
     ?pattern                       search backward
@@ -1021,6 +1083,44 @@ mod tests {
         assert!(first.contains("42"));
         assert_eq!(cont, "    "); // 3 digits + separator, all spaces
         assert!(!cont.contains("42"));
+    }
+
+    fn pager_with(n: usize) -> Pager {
+        let lines: Vec<Line> = (0..n).map(|i| line(&format!("line {}", i))).collect();
+        let mut p = Pager::new("t".to_string(), lines, false, false);
+        p.cols = 80;
+        p.rows = 24;
+        p
+    }
+
+    #[test]
+    fn mark_set_and_jump() {
+        let mut p = pager_with(100);
+        p.goto_line(50);
+        p.marks.insert('a', (p.top, p.sub));
+        p.goto_line(10);
+        assert_eq!(p.top, 10);
+        p.goto_mark('a');
+        assert_eq!(p.top, 50);
+    }
+
+    #[test]
+    fn quote_quote_returns_to_previous_position() {
+        let mut p = pager_with(100);
+        p.goto_line(10);
+        p.marks.insert('a', (50, 0));
+        p.goto_mark('a'); // jump to 50, remembering 10
+        assert_eq!(p.top, 50);
+        p.goto_mark('\''); // '' back to 10
+        assert_eq!(p.top, 10);
+    }
+
+    #[test]
+    fn jump_to_unset_mark_reports_and_stays() {
+        let mut p = pager_with(100);
+        p.goto_mark('z');
+        assert!(p.message.is_some());
+        assert_eq!(p.top, 0);
     }
 }
 
