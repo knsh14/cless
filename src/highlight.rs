@@ -357,3 +357,40 @@ fn push_text(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test for the tree-sitter parse + highlight path: catches a broken
+    /// grammar/core ABI after a tree-sitter dependency bump (the build alone
+    /// only proves the Rust API matches, not that parsing produces highlights).
+    #[test]
+    fn highlights_rust_source() {
+        let src = "fn main() {\n    let x = 42;\n}\n";
+        let lines = highlight_file(src, "demo.rs");
+
+        // Reconstructing the spans must reproduce the input exactly.
+        let mut reconstructed = String::new();
+        for line in &lines {
+            for (_, text) in &line.spans {
+                reconstructed.push_str(text);
+            }
+            reconstructed.push('\n');
+        }
+        assert_eq!(reconstructed, src);
+
+        // More than one distinct foreground color => tree-sitter actually
+        // highlighted tokens (keyword/number/etc.), not just the default.
+        let colors: std::collections::HashSet<(u8, u8, u8)> = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|(s, _)| (s.foreground.r, s.foreground.g, s.foreground.b))
+            .collect();
+        assert!(
+            colors.len() > 1,
+            "expected multiple highlight colors, got {:?}",
+            colors
+        );
+    }
+}
