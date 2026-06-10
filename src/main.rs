@@ -8,22 +8,25 @@ mod pager;
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let mut wrap = true;
+    let mut numbers = false;
     let mut path: Option<&str> = None;
     for arg in &args[1..] {
         match arg.as_str() {
             "-h" | "--help" => {
-                eprintln!("usage: cless [-S] <file>");
+                eprintln!("usage: cless [-S] [-N] <file>");
                 return ExitCode::from(2);
             }
             // -S: chop long lines (disable wrapping), like less.
             "-S" => wrap = false,
+            // -N: show line numbers, like less.
+            "-N" => numbers = true,
             other if other.starts_with('-') && other.len() > 1 => {
                 eprintln!("cless: unknown option: {}", other);
                 return ExitCode::from(2);
             }
             other => {
                 if path.is_some() {
-                    eprintln!("usage: cless [-S] <file>");
+                    eprintln!("usage: cless [-S] [-N] <file>");
                     return ExitCode::from(2);
                 }
                 path = Some(other);
@@ -31,7 +34,7 @@ fn main() -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: cless [-S] <file>");
+        eprintln!("usage: cless [-S] [-N] <file>");
         return ExitCode::from(2);
     };
 
@@ -45,7 +48,7 @@ fn main() -> ExitCode {
 
     let lines = highlight::highlight_file(&content, path);
 
-    if let Err(e) = pager::run(path.to_string(), lines, wrap) {
+    if let Err(e) = pager::run(path.to_string(), lines, wrap, numbers) {
         eprintln!("cless: {}", e);
         return ExitCode::from(1);
     }

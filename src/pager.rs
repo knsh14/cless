@@ -28,9 +28,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(name: String, lines: Vec<Line>, wrap: bool) -> io::Result<()> {
+pub fn run(name: String, lines: Vec<Line>, wrap: bool, numbers: bool) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let mut pager = Pager::new(name, lines, wrap);
+    let mut pager = Pager::new(name, lines, wrap, numbers);
     pager.run()
 }
 
@@ -60,6 +60,7 @@ struct Pager {
     sub: usize,
     left: usize,
     wrap: bool,
+    numbers: bool,
     count: Option<usize>,
     pending_z: bool,
     pending_dash: bool,
@@ -71,7 +72,7 @@ struct Pager {
 }
 
 impl Pager {
-    fn new(name: String, lines: Vec<Line>, wrap: bool) -> Self {
+    fn new(name: String, lines: Vec<Line>, wrap: bool, numbers: bool) -> Self {
         Self {
             name,
             lines,
@@ -79,6 +80,7 @@ impl Pager {
             sub: 0,
             left: 0,
             wrap,
+            numbers,
             count: None,
             pending_z: false,
             pending_dash: false,
@@ -94,9 +96,20 @@ impl Pager {
         self.rows.saturating_sub(1)
     }
 
+    /// Width of the line-number gutter (0 when line numbers are off).
+    fn gutter_width(&self) -> usize {
+        gutter_width(self.lines.len(), self.numbers)
+    }
+
+    /// Columns available for line content after the gutter. Wrapping and all
+    /// position math use this, so wrapped lines fit beside the numbers.
+    fn content_cols(&self) -> usize {
+        self.cols.saturating_sub(self.gutter_width()).max(1)
+    }
+
     /// Number of screen rows the given source line occupies (always >= 1).
     fn line_height(&self, idx: usize) -> usize {
-        line_height_of(&self.lines[idx], self.cols, self.wrap)
+        line_height_of(&self.lines[idx], self.content_cols(), self.wrap)
     }
 
     /// Last display row of the file: (last line, its last wrap segment).
@@ -160,7 +173,7 @@ impl Pager {
 
     /// Jump to the top of source line `line`, clamped into range.
     fn goto_line(&mut self, line: usize) {
-        let p = clamp_pos(&self.lines, self.cols, self.wrap, line, 0).min(self.max_scroll());
+        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, line, 0).min(self.max_scroll());
         (self.top, self.sub) = p;
     }
 
@@ -182,13 +195,29 @@ impl Pager {
         self.wrap = !self.wrap;
         self.left = 0;
         // Keep the current line in view; drop the sub-row offset.
-        let p = clamp_pos(&self.lines, self.cols, self.wrap, self.top, 0).min(self.max_scroll());
+        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, 0).min(self.max_scroll());
         (self.top, self.sub) = p;
         self.message = Some(
             if self.wrap {
                 "Wrap long lines"
             } else {
                 "Chop long lines"
+            }
+            .to_string(),
+        );
+    }
+
+    fn toggle_numbers(&mut self) {
+        self.numbers = !self.numbers;
+        // Gutter changes the content width, so re-clamp the position.
+        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, self.sub)
+            .min(self.max_scroll());
+        (self.top, self.sub) = p;
+        self.message = Some(
+            if self.numbers {
+                "Line numbers"
+            } else {
+                "No line numbers"
             }
             .to_string(),
         );
@@ -202,7 +231,7 @@ impl Pager {
             // Resize may shrink a line's wrap-segment count; guard `sub` first
             // (avoids indexing past the end), then keep the end on-screen.
             (self.top, self.sub) =
-                clamp_pos(&self.lines, self.cols, self.wrap, self.top, self.sub);
+                clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, self.sub);
             let max = self.max_scroll();
             if (self.top, self.sub) > max {
                 (self.top, self.sub) = max;
@@ -246,12 +275,20 @@ impl Pager {
         let body = self.body_rows().max(1);
         let count = self.count;
 
-        // `-S` option toggle (chop long lines), faithful to less's `-` prefix.
+        // Option toggle prefix `-` (less style): `-S` chops, `-N` numbers.
         if std::mem::replace(&mut self.pending_dash, false) {
-            if let KeyCode::Char('S') = k.code {
-                self.toggle_wrap();
-                self.count = None;
-                return false;
+            match k.code {
+                KeyCode::Char('S') => {
+                    self.toggle_wrap();
+                    self.count = None;
+                    return false;
+                }
+                KeyCode::Char('N') => {
+                    self.toggle_numbers();
+                    self.count = None;
+                    return false;
+                }
+                _ => {}
             }
         }
 
@@ -551,11 +588,13 @@ impl Pager {
             return out.flush();
         }
 
+        let cols = self.content_cols();
+        let digits = self.gutter_width().saturating_sub(1);
         let mut top = self.top;
         let mut sub = self.sub;
         // Wrap-segment byte ranges for the current source line (wrap mode only).
         let mut ranges = if self.wrap && top < self.lines.len() {
-            wrap_ranges(&self.lines[top], self.cols)
+            wrap_ranges(&self.lines[top], cols)
         } else {
             Vec::new()
         };
@@ -566,6 +605,11 @@ impl Pager {
                 Clear(ClearType::CurrentLine)
             )?;
             if top < self.lines.len() {
+                // Line number prints on a line's first display row only;
+                // wrapped continuation rows get a blank gutter of equal width.
+                if self.numbers {
+                    out.write_all(gutter(top + 1, sub == 0, digits).as_bytes())?;
+                }
                 if self.wrap {
                     let range = ranges[sub.min(ranges.len() - 1)];
                     let rendered =
@@ -577,12 +621,12 @@ impl Pager {
                         top += 1;
                         sub = 0;
                         if top < self.lines.len() {
-                            ranges = wrap_ranges(&self.lines[top], self.cols);
+                            ranges = wrap_ranges(&self.lines[top], cols);
                         }
                     }
                 } else {
                     let rendered =
-                        render_line(&self.lines[top], self.left, self.cols, self.search.as_ref());
+                        render_line(&self.lines[top], self.left, cols, self.search.as_ref());
                     out.write_all(rendered.as_bytes())?;
                     top += 1;
                 }
@@ -694,6 +738,7 @@ const HELP_TEXT: &str = "\
 
   OTHER
     -S                             toggle wrap / chop long lines
+    -N                             toggle line numbers
     =  ^G                          show current file info
     r  R  ^L                       repaint screen
     h  H                           this help screen
@@ -726,6 +771,37 @@ fn wrap_ranges(line: &Line, cols: usize) -> Vec<(usize, usize)> {
     }
     ranges.push((seg_start, byte_pos));
     ranges
+}
+
+/// Decimal digits in `n` (at least 1, so 0 -> 1).
+fn digit_count(n: usize) -> usize {
+    let mut n = n;
+    let mut d = 1;
+    while n >= 10 {
+        n /= 10;
+        d += 1;
+    }
+    d
+}
+
+/// Width of the line-number gutter: digits of the largest line number plus a
+/// one-column separator, or 0 when line numbers are disabled.
+fn gutter_width(n_lines: usize, numbers: bool) -> usize {
+    if numbers {
+        digit_count(n_lines.max(1)) + 1
+    } else {
+        0
+    }
+}
+
+/// The gutter cell for a display row: the right-aligned line number on a line's
+/// first row, or blanks (same width) on a wrapped continuation row.
+fn gutter(line_no: usize, first_row: bool, digits: usize) -> String {
+    if first_row {
+        format!("\x1b[38;2;90;90;90m{:>w$} \x1b[0m", line_no, w = digits)
+    } else {
+        " ".repeat(digits + 1)
+    }
 }
 
 /// Screen rows a line occupies: 1 in chop mode, else its wrap-segment count.
@@ -909,6 +985,42 @@ mod tests {
     fn clamp_pos_empty_file() {
         let lines: Vec<Line> = Vec::new();
         assert_eq!(clamp_pos(&lines, 5, true, 3, 2), (0, 0));
+    }
+
+    #[test]
+    fn digit_count_boundaries() {
+        assert_eq!(digit_count(0), 1);
+        assert_eq!(digit_count(9), 1);
+        assert_eq!(digit_count(10), 2);
+        assert_eq!(digit_count(99), 2);
+        assert_eq!(digit_count(100), 3);
+    }
+
+    #[test]
+    fn gutter_width_tracks_line_count() {
+        assert_eq!(gutter_width(9, true), 2); // 1 digit + separator
+        assert_eq!(gutter_width(10, true), 3); // 2 digits + separator
+        assert_eq!(gutter_width(1000, true), 5); // 4 digits + separator
+        assert_eq!(gutter_width(1000, false), 0); // disabled
+    }
+
+    #[test]
+    fn line_numbers_narrow_the_wrap_width() {
+        // 6-wide content; at cols=8 with a 3-col gutter (lines<=99) the usable
+        // width is 5, so the line wraps into two segments.
+        let l = line("abcdef");
+        let content_cols = 8 - gutter_width(50, true); // 8 - 3 = 5
+        assert_eq!(content_cols, 5);
+        assert_eq!(wrap_ranges(&l, content_cols), vec![(0, 5), (5, 6)]);
+    }
+
+    #[test]
+    fn gutter_blank_on_continuation_rows() {
+        let first = gutter(42, true, 3);
+        let cont = gutter(42, false, 3);
+        assert!(first.contains("42"));
+        assert_eq!(cont, "    "); // 3 digits + separator, all spaces
+        assert!(!cont.contains("42"));
     }
 }
 
