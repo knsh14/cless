@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 mod highlight;
@@ -33,22 +34,37 @@ fn main() -> ExitCode {
             }
         }
     }
-    let Some(path) = path else {
-        eprintln!("usage: cless [-S] [-N] <file>");
-        return ExitCode::from(2);
-    };
+    // Read from stdin when given `-`, or no file with stdin piped in. The
+    // display name is "(stdin)" and language detection falls back to the
+    // shebang/content since there is no path. `detect_path` feeds extension
+    // detection in highlight_file.
+    let read_stdin = matches!(path, Some("-"))
+        || (path.is_none() && !std::io::stdin().is_terminal());
 
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("cless: {}: {}", path, e);
+    let (content, name, detect_path) = if read_stdin {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("cless: <stdin>: {}", e);
             return ExitCode::from(1);
+        }
+        (buf, "(stdin)".to_string(), "")
+    } else {
+        let Some(path) = path else {
+            eprintln!("usage: cless [-S] [-N] <file>");
+            return ExitCode::from(2);
+        };
+        match fs::read_to_string(path) {
+            Ok(c) => (c, path.to_string(), path),
+            Err(e) => {
+                eprintln!("cless: {}: {}", path, e);
+                return ExitCode::from(1);
+            }
         }
     };
 
-    let lines = highlight::highlight_file(&content, path);
+    let lines = highlight::highlight_file(&content, detect_path);
 
-    if let Err(e) = pager::run(path.to_string(), lines, wrap, numbers) {
+    if let Err(e) = pager::run(name, lines, wrap, numbers) {
         eprintln!("cless: {}", e);
         return ExitCode::from(1);
     }
