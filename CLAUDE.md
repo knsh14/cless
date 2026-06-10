@@ -19,8 +19,9 @@ src/
 ```sh
 cargo build                                       # debug
 cargo build --release                             # first run ~15s (15 C parsers to compile)
-cargo test                                        # pager::tests (render SGR, wrap_ranges, clamp_pos)
-./target/release/cless <file>                     # wraps long lines; -S to chop instead
+cargo test                                        # pager::tests (render SGR, wrap_ranges, clamp_pos, gutter, marks, files, follow)
+./target/release/cless <file>...                  # wraps long lines; -S to chop, -N for line numbers
+cat file | ./target/release/cless                 # stdin (keys still come from /dev/tty)
 ```
 
 ## Release procedure
@@ -45,13 +46,18 @@ git push origin v0.1.0
 
 ### `pager.rs`
 
-- `Pager` struct fields: `top`, `sub`, `left`, `wrap`, `count`, `pending_z`, `pending_dash`, `mode`, `search`, `message`, `cols`, `rows`
+- `Pager` struct fields: `sources`, `index`, `name`, `lines`, `top`, `sub`, `left`, `wrap`, `numbers`, `following`, `follow_len`, `count`, `pending`, `marks`, `prev_pos`, `mode`, `search`, `message`, `cols`, `rows`
 - State machine: `Mode::Normal | SearchInput | Help`
+- Multi-key prefixes use one `Pending` enum (`None`/`Z`/`Dash`/`Mark`/`Quote`/`Colon`) so only one can be live at once; the follow-up key is resolved at the top of `handle_normal`.
 - Full redraw every frame (no diffing). Each row is cleared with `Clear(ClearType::CurrentLine)` before writing.
 - `render_line` emits a complete `\x1b[0;7;38;2;R;G;Bm`-form SGR per chunk so older terminals render inverse video reliably.
 - Search uses the `regex` crate with smart-case (`case_insensitive` when the pattern is all lowercase).
 - **Line wrapping (`wrap` field)** — on by default, like `less`; `-S` (flag or the `-S` key) chops long lines instead. Scroll position is `(top, sub)`: source line `top`, plus the wrap-segment `sub` at the top of the screen (`sub` is always 0 in chop mode). `wrap_ranges(line, cols)` is the single source of truth for where a line breaks (returns byte ranges over the concatenated span text); `render_segment` renders one such range and never re-decides the break. Navigation (`j`/`k`/page/half) moves by *display* rows via `pos_down`/`pos_up`; `g`/`G`/`%`/search jump to a logical line (`sub = 0`). Horizontal scroll (`left`, ←/→) is chop-mode only.
 - `max_scroll()` is the wrap-aware analog of the old `max_top` — the position that puts the final screenful at the bottom; short files stay at the top (matches `less`: they do not scroll on search, only matches are highlighted). `clamp_pos` (pure, unit-tested) guards `sub` against pointing past a line's segment count after a resize widens the screen.
+- **Line numbers (`numbers` field, `-N`)** — a gutter of `digit_count(lines) + 1` columns; the number prints on a line's first display row, continuation rows get a blank gutter. Wrapping and all position math run on `content_cols()` (screen width minus the gutter) so wrapped lines fit beside the numbers.
+- **Inputs (`Source`)** — `Source::File` is read + highlighted lazily on switch; `Source::Memory` holds pre-highlighted stdin (single source, can't be re-read). `:n`/`:p` call `load()` which resets view/marks/follow. stdin is detected in `main.rs` via `IsTerminal` and can't be mixed with files.
+- **Marks** — `m<c>` stores `(top, sub)` in `marks`; `'<c>` restores via `jump_to` (which records `prev_pos`), `''` returns to `prev_pos`. All jumps go through `clamp_pos`, so they compose with wrap/gutter changes.
+- **Tail-follow (`F`)** — `start_follow` jumps to the end and sets `following`; the run loop then `event::poll`s with a timeout and `poll_growth` re-stats the file size on idle, reloading + re-highlighting the whole file (std-only, no `notify` dep). The loop redraws only on input/resize/new-data so an idle follow doesn't flicker. Files only; any key stops.
 
 ## Development conventions
 
@@ -63,13 +69,8 @@ git push origin v0.1.0
 
 ## Verification workflow
 
-Raw mode is required, so the interactive pager cannot be exercised in a headless environment. Run `cargo test` to cover the `render_line` SGR output. For visual / interactive checks, run the binary in a real terminal.
+Raw mode is required, so the interactive pager cannot be exercised in a headless environment. `cargo test` covers only the pure logic — `render_line`/`render_segment` SGR, `wrap_ranges`, `clamp_pos`, the line-number gutter, mark jumps, file switching, and `poll_growth` (a real temp-file growth check). Interactive behaviour (wrapped rendering, resize reflow, `-S`/`-N` toggles, `:n`/`:p`, and `F` follow) must be checked by running the binary in a real terminal.
 
 ## Unimplemented
 
-- stdin / pipe input
-- Line numbers (`-N`)
-- Tail-follow mode (`F`)
-- Marks (`m` / `'`)
-- Multiple files (`:n`)
 - Theme-switch flag / configuration file
