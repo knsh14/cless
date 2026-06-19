@@ -35,6 +35,22 @@ git push origin v0.1.0
 # 4. cargo binstall cless picks them up automatically
 ```
 
+## Version control
+
+This repo is managed with **jj (Jujutsu)** in a **colocated** layout (`.git` and `.jj` coexist; `.jj` is git-ignored). GitButler is no longer used. Standard git tooling (`cargo`, CI, `git tag`) still works unchanged.
+
+```sh
+jj new main                       # start work on top of main
+jj st / jj diff                   # inspect the working-copy commit (@); no add/stage
+jj describe -m "feat(pager): …"   # set the commit message
+jj bookmark set main -r @         # advance the main bookmark to @
+jj git push                       # push to origin (jj uses bookmarks, not branches)
+jj git fetch                      # local main auto-updates (main@origin is tracked)
+jj undo                           # undo the last operation (jj op log for history)
+```
+
+Releases still use git tags directly: `git tag v0.1.0 && git push origin v0.1.0` (jj does not create tags).
+
 ## Architecture notes
 
 ### `highlight.rs`
