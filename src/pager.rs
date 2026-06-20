@@ -1120,6 +1120,54 @@ fn build_view(lines: &[Line], filters: &[Filter]) -> Option<Vec<usize>> {
     Some(view)
 }
 
+/// Logical index of the first visible line, or `None` if nothing is visible.
+fn first_visible(view: Option<&[usize]>, n_lines: usize) -> Option<usize> {
+    match view {
+        None => (n_lines > 0).then_some(0),
+        Some(v) => v.first().copied(),
+    }
+}
+
+/// Logical index of the last visible line, or `None` if nothing is visible.
+fn last_visible(view: Option<&[usize]>, n_lines: usize) -> Option<usize> {
+    match view {
+        None => n_lines.checked_sub(1),
+        Some(v) => v.last().copied(),
+    }
+}
+
+/// Smallest visible line strictly greater than `line` (`line` need not itself
+/// be visible).
+fn next_visible(view: Option<&[usize]>, n_lines: usize, line: usize) -> Option<usize> {
+    match view {
+        None => (line + 1 < n_lines).then_some(line + 1),
+        Some(v) => v.get(v.partition_point(|&x| x <= line)).copied(),
+    }
+}
+
+/// Largest visible line strictly less than `line`.
+fn prev_visible(view: Option<&[usize]>, line: usize) -> Option<usize> {
+    match view {
+        None => line.checked_sub(1),
+        Some(v) => {
+            let p = v.partition_point(|&x| x < line);
+            (p > 0).then(|| v[p - 1])
+        }
+    }
+}
+
+/// Nearest visible line at or after `line`, falling back to the last visible
+/// line; used to pull a jump target into the filtered view.
+fn snap_visible(view: Option<&[usize]>, n_lines: usize, line: usize) -> usize {
+    match view {
+        None => line.min(n_lines.saturating_sub(1)),
+        Some(v) => {
+            let p = v.partition_point(|&x| x < line);
+            v.get(p).or_else(|| v.last()).copied().unwrap_or(0)
+        }
+    }
+}
+
 fn truncate_pad(s: &mut String, cols: usize) {
     let mut w = 0usize;
     let mut keep = String::new();
@@ -1198,6 +1246,53 @@ mod tests {
     fn build_view_smart_case_is_insensitive_for_lowercase() {
         let lines = vec![line("APPLE"), line("banana")];
         assert_eq!(build_view(&lines, &[filt("apple", false)]), Some(vec![0]));
+    }
+
+    #[test]
+    fn visible_helpers_identity_when_unfiltered() {
+        let n = 3;
+        assert_eq!(first_visible(None, n), Some(0));
+        assert_eq!(last_visible(None, n), Some(2));
+        assert_eq!(next_visible(None, n, 0), Some(1));
+        assert_eq!(next_visible(None, n, 2), None);
+        assert_eq!(prev_visible(None, 1), Some(0));
+        assert_eq!(prev_visible(None, 0), None);
+        assert_eq!(snap_visible(None, n, 5), 2);
+        assert_eq!(snap_visible(None, n, 1), 1);
+    }
+
+    #[test]
+    fn visible_helpers_skip_hidden_lines() {
+        let v = vec![1usize, 4, 7];
+        let view = Some(v.as_slice());
+        let n = 10;
+        assert_eq!(first_visible(view, n), Some(1));
+        assert_eq!(last_visible(view, n), Some(7));
+        assert_eq!(next_visible(view, n, 1), Some(4));
+        assert_eq!(next_visible(view, n, 4), Some(7));
+        assert_eq!(next_visible(view, n, 7), None);
+        // From a hidden line, step to the next visible one.
+        assert_eq!(next_visible(view, n, 2), Some(4));
+        assert_eq!(prev_visible(view, 7), Some(4));
+        assert_eq!(prev_visible(view, 4), Some(1));
+        assert_eq!(prev_visible(view, 1), None);
+        assert_eq!(prev_visible(view, 5), Some(4));
+    }
+
+    #[test]
+    fn snap_visible_rounds_to_nearest_at_or_after() {
+        let v = vec![2usize, 5, 9];
+        let view = Some(v.as_slice());
+        assert_eq!(snap_visible(view, 10, 0), 2); // before first -> first
+        assert_eq!(snap_visible(view, 10, 5), 5); // exact
+        assert_eq!(snap_visible(view, 10, 6), 9); // gap -> next visible
+        assert_eq!(snap_visible(view, 10, 99), 9); // past end -> last visible
+    }
+
+    #[test]
+    fn visible_helpers_empty() {
+        assert_eq!(first_visible(None, 0), None);
+        assert_eq!(last_visible(None, 0), None);
     }
 
     #[test]
