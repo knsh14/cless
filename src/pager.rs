@@ -798,33 +798,35 @@ impl Pager {
         let Some(state) = self.search.as_ref() else {
             return;
         };
-        if self.lines.is_empty() {
+        let view = self.view.as_deref();
+        let n = self.lines.len();
+        if first_visible(view, n).is_none() {
             self.message = Some("Pattern not found".to_string());
             return;
         }
-        let last = self.lines.len() - 1;
-        let start = match (dir, skip_current) {
-            (SearchDir::Forward, true) => (self.top + 1).min(last),
-            (SearchDir::Forward, false) => self.top,
-            (SearchDir::Backward, true) => self.top.saturating_sub(1),
-            (SearchDir::Backward, false) => self.top,
+        // Start at the current line, or step one visible line past it.
+        let mut cur = if skip_current {
+            match dir {
+                SearchDir::Forward => next_visible(view, n, self.top),
+                SearchDir::Backward => prev_visible(view, self.top),
+            }
+        } else {
+            Some(self.top)
         };
-
-        let found = match dir {
-            SearchDir::Forward => (start..self.lines.len())
-                .find(|&i| state.re.is_match(&line_plain(&self.lines[i]))),
-            SearchDir::Backward => (0..=start.min(last))
-                .rev()
-                .find(|&i| state.re.is_match(&line_plain(&self.lines[i]))),
-        };
-
+        let mut found = None;
+        while let Some(i) = cur {
+            if state.re.is_match(&line_plain(&self.lines[i])) {
+                found = Some(i);
+                break;
+            }
+            cur = match dir {
+                SearchDir::Forward => next_visible(view, n, i),
+                SearchDir::Backward => prev_visible(view, i),
+            };
+        }
         match found {
-            Some(i) => {
-                self.goto_line(i);
-            }
-            None => {
-                self.message = Some("Pattern not found".to_string());
-            }
+            Some(i) => self.goto_line(i),
+            None => self.message = Some("Pattern not found".to_string()),
         }
     }
 
@@ -858,6 +860,11 @@ impl Pager {
         let cols = self.content_cols();
         let digits = self.gutter_width().saturating_sub(1);
         let mut top = self.top;
+        // A filter that matches nothing leaves `top` at 0 (a hidden line);
+        // park past the end so every body row renders the `~` filler.
+        if first_visible(self.view.as_deref(), self.lines.len()).is_none() {
+            top = self.lines.len();
+        }
         let mut sub = self.sub;
         // Wrap-segment byte ranges for the current source line (wrap mode only).
         let mut ranges = if self.wrap && top < self.lines.len() {
@@ -885,17 +892,23 @@ impl Pager {
                     if sub + 1 < ranges.len() {
                         sub += 1;
                     } else {
-                        top += 1;
-                        sub = 0;
-                        if top < self.lines.len() {
-                            ranges = wrap_ranges(&self.lines[top], cols);
+                        match next_visible(self.view.as_deref(), self.lines.len(), top) {
+                            Some(next) => {
+                                top = next;
+                                sub = 0;
+                                ranges = wrap_ranges(&self.lines[top], cols);
+                            }
+                            // No more visible lines: park past the end so the
+                            // remaining rows render the `~` filler.
+                            None => top = self.lines.len(),
                         }
                     }
                 } else {
                     let rendered =
                         render_line(&self.lines[top], self.left, cols, self.search.as_ref());
                     out.write_all(rendered.as_bytes())?;
-                    top += 1;
+                    top = next_visible(self.view.as_deref(), self.lines.len(), top)
+                        .unwrap_or(self.lines.len());
                 }
             } else {
                 out.write_all(b"\x1b[38;2;90;90;90m~\x1b[0m")?;
