@@ -117,6 +117,8 @@ struct Pager {
     count: Option<usize>,
     pending: Pending,
     marks: HashMap<char, (usize, usize)>,
+    filters: Vec<Filter>,
+    view: Option<Vec<usize>>,
     prev_pos: Option<(usize, usize)>,
     mode: Mode,
     search: Option<SearchState>,
@@ -142,6 +144,8 @@ impl Pager {
             count: None,
             pending: Pending::None,
             marks: HashMap::new(),
+            filters: Vec::new(),
+            view: None,
             prev_pos: None,
             mode: Mode::Normal,
             search: None,
@@ -170,6 +174,8 @@ impl Pager {
         self.sub = 0;
         self.left = 0;
         self.marks.clear();
+        self.filters.clear();
+        self.view = None;
         self.prev_pos = None;
         self.following = false;
         Ok(())
@@ -224,11 +230,10 @@ impl Pager {
 
     /// Last display row of the file: (last line, its last wrap segment).
     fn end_pos(&self) -> (usize, usize) {
-        if self.lines.is_empty() {
-            return (0, 0);
+        match last_visible(self.view.as_deref(), self.lines.len()) {
+            None => (0, 0),
+            Some(last) => (last, self.line_height(last).saturating_sub(1)),
         }
-        let last = self.lines.len() - 1;
-        (last, self.line_height(last).saturating_sub(1))
     }
 
     /// Scroll position that puts the final screenful at the bottom — the wrap
@@ -241,14 +246,15 @@ impl Pager {
 
     /// Move a position down by `n` display rows, stopping at `end_pos`.
     fn pos_down(&self, mut top: usize, mut sub: usize, n: usize) -> (usize, usize) {
+        let view = self.view.as_deref();
         for _ in 0..n {
             if top >= self.lines.len() {
                 break;
             }
             if sub + 1 < self.line_height(top) {
                 sub += 1;
-            } else if top + 1 < self.lines.len() {
-                top += 1;
+            } else if let Some(next) = next_visible(view, self.lines.len(), top) {
+                top = next;
                 sub = 0;
             } else {
                 break;
@@ -259,12 +265,13 @@ impl Pager {
 
     /// Move a position up by `n` display rows, stopping at the very top.
     fn pos_up(&self, mut top: usize, mut sub: usize, n: usize) -> (usize, usize) {
+        let view = self.view.as_deref();
         for _ in 0..n {
             if sub > 0 {
                 sub -= 1;
-            } else if top > 0 {
-                top -= 1;
-                sub = self.line_height(top).saturating_sub(1);
+            } else if let Some(prev) = prev_visible(view, top) {
+                top = prev;
+                sub = self.line_height(prev).saturating_sub(1);
             } else {
                 break;
             }
@@ -281,9 +288,28 @@ impl Pager {
         (self.top, self.sub) = self.pos_up(self.top, self.sub, n);
     }
 
+    /// View-aware position clamp: snap `top` onto a visible line, then clamp
+    /// `sub` to that line's segment count. Replaces direct `clamp_pos` calls so
+    /// every jump/resize lands on a visible line.
+    fn clamp_view(&self, top: usize, sub: usize) -> (usize, usize) {
+        if self.lines.is_empty() {
+            return (0, 0);
+        }
+        let top = snap_visible(self.view.as_deref(), self.lines.len(), top);
+        clamp_pos(&self.lines, self.content_cols(), self.wrap, top, sub)
+    }
+
+    /// Rebuild the visible-line cache from `filters` and pull the scroll
+    /// position back onto a visible line.
+    fn apply_filters(&mut self) {
+        self.view = build_view(&self.lines, &self.filters);
+        let p = self.clamp_view(self.top, 0);
+        (self.top, self.sub) = p.min(self.max_scroll());
+    }
+
     /// Jump to the top of source line `line`, clamped into range.
     fn goto_line(&mut self, line: usize) {
-        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, line, 0).min(self.max_scroll());
+        let p = self.clamp_view(line, 0).min(self.max_scroll());
         (self.top, self.sub) = p;
     }
 
@@ -294,8 +320,7 @@ impl Pager {
     /// Jump to a saved position, remembering the current one for `''`.
     fn jump_to(&mut self, pos: (usize, usize)) {
         let cur = (self.top, self.sub);
-        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, pos.0, pos.1)
-            .min(self.max_scroll());
+        let p = self.clamp_view(pos.0, pos.1).min(self.max_scroll());
         self.prev_pos = Some(cur);
         (self.top, self.sub) = p;
     }
@@ -327,7 +352,7 @@ impl Pager {
         self.wrap = !self.wrap;
         self.left = 0;
         // Keep the current line in view; drop the sub-row offset.
-        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, 0).min(self.max_scroll());
+        let p = self.clamp_view(self.top, 0).min(self.max_scroll());
         (self.top, self.sub) = p;
         self.message = Some(
             if self.wrap {
@@ -342,8 +367,7 @@ impl Pager {
     fn toggle_numbers(&mut self) {
         self.numbers = !self.numbers;
         // Gutter changes the content width, so re-clamp the position.
-        let p = clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, self.sub)
-            .min(self.max_scroll());
+        let p = self.clamp_view(self.top, self.sub).min(self.max_scroll());
         (self.top, self.sub) = p;
         self.message = Some(
             if self.numbers {
@@ -362,8 +386,7 @@ impl Pager {
         self.rows = r.max(2) as usize;
         // Resize may shrink a line's wrap-segment count; guard `sub` first
         // (avoids indexing past the end), then keep the end on-screen.
-        (self.top, self.sub) =
-            clamp_pos(&self.lines, self.content_cols(), self.wrap, self.top, self.sub);
+        (self.top, self.sub) = self.clamp_view(self.top, self.sub);
         let max = self.max_scroll();
         if (self.top, self.sub) > max {
             (self.top, self.sub) = max;
