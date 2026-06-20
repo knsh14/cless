@@ -76,6 +76,12 @@ struct SearchState {
     dir: SearchDir,
 }
 
+/// One active `&` filter. A line passes when `re.is_match(text) != negate`.
+struct Filter {
+    re: Regex,
+    negate: bool,
+}
+
 enum Mode {
     Normal,
     SearchInput { dir: SearchDir, buffer: String },
@@ -1097,6 +1103,23 @@ fn line_plain(line: &Line) -> String {
     s
 }
 
+/// Visible logical-line indices for the given filters, or `None` when there are
+/// no filters (meaning "all lines" — avoids allocating `0..n` for the common
+/// unfiltered case). A line is visible only when it satisfies every filter (AND);
+/// a negated filter is satisfied when its pattern does NOT match.
+fn build_view(lines: &[Line], filters: &[Filter]) -> Option<Vec<usize>> {
+    if filters.is_empty() {
+        return None;
+    }
+    let view = (0..lines.len())
+        .filter(|&i| {
+            let text = line_plain(&lines[i]);
+            filters.iter().all(|f| f.re.is_match(&text) != f.negate)
+        })
+        .collect();
+    Some(view)
+}
+
 fn truncate_pad(s: &mut String, cols: usize) {
     let mut w = 0usize;
     let mut keep = String::new();
@@ -1136,6 +1159,45 @@ mod tests {
             re: Regex::new(pattern).unwrap(),
             dir: SearchDir::Forward,
         }
+    }
+
+    fn filt(pat: &str, negate: bool) -> Filter {
+        let smart = pat.chars().all(|c| !c.is_uppercase());
+        Filter {
+            re: RegexBuilder::new(pat).case_insensitive(smart).build().unwrap(),
+            negate,
+        }
+    }
+
+    #[test]
+    fn build_view_none_when_no_filters() {
+        let lines = vec![line("a"), line("b")];
+        assert_eq!(build_view(&lines, &[]), None);
+    }
+
+    #[test]
+    fn build_view_keeps_matching_lines() {
+        let lines = vec![line("apple"), line("banana"), line("apricot")];
+        assert_eq!(build_view(&lines, &[filt("ap", false)]), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn build_view_negate_excludes_matches() {
+        let lines = vec![line("apple"), line("banana"), line("apricot")];
+        assert_eq!(build_view(&lines, &[filt("ap", true)]), Some(vec![1]));
+    }
+
+    #[test]
+    fn build_view_multiple_filters_are_anded() {
+        let lines = vec![line("apple pie"), line("apple"), line("cherry pie")];
+        let filters = vec![filt("apple", false), filt("pie", false)];
+        assert_eq!(build_view(&lines, &filters), Some(vec![0]));
+    }
+
+    #[test]
+    fn build_view_smart_case_is_insensitive_for_lowercase() {
+        let lines = vec![line("APPLE"), line("banana")];
+        assert_eq!(build_view(&lines, &[filt("apple", false)]), Some(vec![0]));
     }
 
     #[test]
