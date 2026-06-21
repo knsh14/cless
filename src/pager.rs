@@ -544,6 +544,12 @@ impl Pager {
                 self.count = None;
                 return false;
             }
+            // `:f` shows file info, like less.
+            (Pending::Colon, KeyCode::Char('f')) => {
+                self.message = Some(self.info_string());
+                self.count = None;
+                return false;
+            }
             _ => {}
         }
 
@@ -908,14 +914,18 @@ impl Pager {
         } else {
             (last * 100 / total).min(100)
         };
-        format!(
+        let base = format!(
             "{}  lines {}-{}/{}  {}%",
             self.name,
             self.top + 1,
             last.max(self.top + 1),
             total,
             pct
-        )
+        );
+        match &self.view {
+            Some(v) => format!("{}  [filtered {}/{}]", base, v.len(), total),
+            None => base,
+        }
     }
 
     fn draw(&self) -> io::Result<()> {
@@ -1116,7 +1126,7 @@ const HELP_TEXT: &str = "\
   OTHER
     -S                             toggle wrap / chop long lines
     -N                             toggle line numbers
-    =  ^G                          show current file info
+    =  ^G  :f                      show current file info
     r  R  ^L                       repaint screen
     h  H                           this help screen
     q  Q  ZZ  ^C                   quit
@@ -1559,6 +1569,12 @@ mod tests {
         p
     }
 
+    fn test_pager(lines: Vec<Line>) -> Pager {
+        let mut p = pager_with(lines.len());
+        p.lines = lines;
+        p
+    }
+
     #[test]
     fn mark_set_and_jump() {
         let mut p = pager_with(100);
@@ -1637,6 +1653,17 @@ mod tests {
         assert!(!p.poll_growth().unwrap());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn info_string_notes_active_filter() {
+        let mut p = test_pager(vec![line("apple"), line("banana"), line("apricot")]);
+        // No filter: no suffix.
+        assert!(!p.info_string().contains("[filtered"));
+        p.filters.push(filt("ap", false));
+        p.apply_filters();
+        let info = p.info_string();
+        assert!(info.contains("[filtered 2/3]"), "got: {}", info);
     }
 }
 
