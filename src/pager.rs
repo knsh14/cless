@@ -85,6 +85,7 @@ struct Filter {
 enum Mode {
     Normal,
     SearchInput { dir: SearchDir, buffer: String },
+    FilterInput { buffer: String },
     Help,
 }
 
@@ -442,6 +443,8 @@ impl Pager {
         };
         self.follow_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         self.following = true;
+        self.filters.clear();
+        self.apply_filters();
         self.goto_end();
         self.message = Some("Waiting for data... (any key to stop)".to_string());
     }
@@ -477,7 +480,7 @@ impl Pager {
 
     fn handle_key(&mut self, k: KeyEvent) -> bool {
         // Any keypress clears a transient message except while in search input.
-        if !matches!(self.mode, Mode::SearchInput { .. }) {
+        if !matches!(self.mode, Mode::SearchInput { .. } | Mode::FilterInput { .. }) {
             self.message = None;
         }
 
@@ -485,6 +488,10 @@ impl Pager {
             Mode::Normal => self.handle_normal(k),
             Mode::SearchInput { .. } => {
                 self.handle_search_input(k);
+                false
+            }
+            Mode::FilterInput { .. } => {
+                self.handle_filter_input(k);
                 false
             }
             Mode::Help => {
@@ -693,6 +700,14 @@ impl Pager {
             (KeyCode::Char('n'), KeyModifiers::NONE) => self.repeat_search(false),
             (KeyCode::Char('N'), _) => self.repeat_search(true),
 
+            // ---- Filter: show only matching lines (& clears with empty input)
+            (KeyCode::Char('&'), _) => {
+                self.mode = Mode::FilterInput {
+                    buffer: String::new(),
+                };
+                consume = false;
+            }
+
             // ---- Repaint (no-op; loop always redraws)
             (KeyCode::Char('r'), _)
             | (KeyCode::Char('R'), _)
@@ -765,6 +780,61 @@ impl Pager {
             }
             _ => {
                 self.mode = Mode::SearchInput { dir, buffer };
+            }
+        }
+    }
+
+    fn handle_filter_input(&mut self, k: KeyEvent) {
+        let mut buffer = match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::FilterInput { buffer } => buffer,
+            other => {
+                self.mode = other;
+                return;
+            }
+        };
+
+        match (k.code, k.modifiers) {
+            (KeyCode::Enter, _) => {
+                if buffer.is_empty() {
+                    self.filters.clear();
+                    self.apply_filters();
+                    self.message = Some("Filter cleared".to_string());
+                    return;
+                }
+                // A leading `!` negates: show lines that do NOT match.
+                let (negate, pat) = match buffer.strip_prefix('!') {
+                    Some(rest) => (true, rest),
+                    None => (false, buffer.as_str()),
+                };
+                let smart_case = pat.chars().all(|c| !c.is_uppercase());
+                match RegexBuilder::new(pat)
+                    .case_insensitive(smart_case)
+                    .build()
+                {
+                    Ok(re) => {
+                        self.filters.push(Filter { re, negate });
+                        self.apply_filters();
+                        self.message = None;
+                    }
+                    Err(e) => self.message = Some(format!("Invalid regex: {}", e)),
+                }
+            }
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.message = None;
+            }
+            (KeyCode::Backspace, _) => {
+                if buffer.pop().is_none() {
+                    self.message = None;
+                } else {
+                    self.mode = Mode::FilterInput { buffer };
+                }
+            }
+            (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+                buffer.push(c);
+                self.mode = Mode::FilterInput { buffer };
+            }
+            _ => {
+                self.mode = Mode::FilterInput { buffer };
             }
         }
     }
@@ -934,6 +1004,16 @@ impl Pager {
                 out.flush()?;
                 return Ok(());
             }
+            Mode::FilterInput { buffer } => {
+                out.write_all(format!("&{}", buffer).as_bytes())?;
+                queue!(out, cursor::Show)?;
+                queue!(
+                    out,
+                    cursor::MoveTo((buffer.len() + 1).min(self.cols) as u16, body as u16)
+                )?;
+                out.flush()?;
+                return Ok(());
+            }
             Mode::Help => unreachable!(),
             Mode::Normal => {
                 queue!(out, cursor::Hide)?;
@@ -1030,6 +1110,8 @@ const HELP_TEXT: &str = "\
     n                              repeat last search
     N                              repeat in reverse direction
                                    (smart-case: lower-only -> ignore case)
+    &pattern                       show only matching lines (&!pat excludes,
+                                   & alone clears; multiple & combine)
 
   OTHER
     -S                             toggle wrap / chop long lines
