@@ -42,6 +42,30 @@ impl Source {
     }
 }
 
+/// A startup positioning action from a `+cmd` / `-p pattern` argument, applied
+/// once after the first file is loaded.
+pub enum StartAction {
+    None,
+    Line(usize),    // 0-based line index
+    End,
+    Search(String), // forward search pattern
+}
+
+/// Parse the text after a leading `+`: `G` (end), `/pat` (search), or a line
+/// number (1-based in the argument, stored 0-based). Returns `None` for forms
+/// we do not support. `pub` so the CLI parser in `main.rs` can call it.
+pub fn parse_plus(rest: &str) -> Option<StartAction> {
+    if rest == "G" {
+        Some(StartAction::End)
+    } else if let Some(pat) = rest.strip_prefix('/') {
+        (!pat.is_empty()).then(|| StartAction::Search(pat.to_string()))
+    } else if let Ok(n) = rest.parse::<usize>() {
+        Some(StartAction::Line(n.saturating_sub(1)))
+    } else {
+        None
+    }
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -59,9 +83,14 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(sources: Vec<Source>, wrap: bool, numbers: bool) -> io::Result<()> {
+pub fn run(
+    sources: Vec<Source>,
+    wrap: bool,
+    numbers: bool,
+    start: StartAction,
+) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let mut pager = Pager::new(sources, wrap, numbers)?;
+    let mut pager = Pager::new(sources, wrap, numbers, start)?;
     pager.run()
 }
 
@@ -120,6 +149,7 @@ struct Pager {
     marks: HashMap<char, (usize, usize)>,
     filters: Vec<Filter>,
     view: Option<Vec<usize>>,
+    start: StartAction,
     prev_pos: Option<(usize, usize)>,
     mode: Mode,
     search: Option<SearchState>,
@@ -129,7 +159,12 @@ struct Pager {
 }
 
 impl Pager {
-    fn new(sources: Vec<Source>, wrap: bool, numbers: bool) -> io::Result<Self> {
+    fn new(
+        sources: Vec<Source>,
+        wrap: bool,
+        numbers: bool,
+        start: StartAction,
+    ) -> io::Result<Self> {
         let mut pager = Self {
             sources,
             index: 0,
@@ -147,6 +182,7 @@ impl Pager {
             marks: HashMap::new(),
             filters: Vec::new(),
             view: None,
+            start,
             prev_pos: None,
             mode: Mode::Normal,
             search: None,
@@ -395,8 +431,29 @@ impl Pager {
         Ok(())
     }
 
+    /// Run the startup positioning action once, after the first size refresh so
+    /// `goto_end`/search see real terminal dimensions.
+    fn apply_start(&mut self) {
+        match std::mem::replace(&mut self.start, StartAction::None) {
+            StartAction::None => {}
+            StartAction::Line(n) => self.goto_line(n),
+            StartAction::End => self.goto_end(),
+            StartAction::Search(pat) => {
+                let smart_case = pat.chars().all(|c| !c.is_uppercase());
+                match RegexBuilder::new(&pat).case_insensitive(smart_case).build() {
+                    Ok(re) => {
+                        self.search = Some(SearchState { re, dir: SearchDir::Forward });
+                        self.do_search(SearchDir::Forward, false);
+                    }
+                    Err(e) => self.message = Some(format!("Invalid regex: {}", e)),
+                }
+            }
+        }
+    }
+
     fn run(&mut self) -> io::Result<()> {
         self.refresh_size()?;
+        self.apply_start();
         self.draw()?;
         loop {
             // Redraw only after something changes (input, resize, or — while
@@ -1563,7 +1620,7 @@ mod tests {
 
     fn pager_with(n: usize) -> Pager {
         let lines: Vec<Line> = (0..n).map(|i| line(&format!("line {}", i))).collect();
-        let mut p = Pager::new(vec![Source::memory("t", lines)], false, false).unwrap();
+        let mut p = Pager::new(vec![Source::memory("t", lines)], false, false, StartAction::None).unwrap();
         p.cols = 80;
         p.rows = 24;
         p
@@ -1610,7 +1667,7 @@ mod tests {
         let a: Vec<Line> = (0..10).map(|i| line(&format!("a{}", i))).collect();
         let b: Vec<Line> = (0..5).map(|i| line(&format!("b{}", i))).collect();
         let mut p =
-            Pager::new(vec![Source::memory("a", a), Source::memory("b", b)], false, false).unwrap();
+            Pager::new(vec![Source::memory("a", a), Source::memory("b", b)], false, false, StartAction::None).unwrap();
         p.cols = 80;
         p.rows = 24;
         assert_eq!((p.index, p.lines.len()), (0, 10));
@@ -1634,7 +1691,7 @@ mod tests {
         std::fs::write(&path, "line1\n").unwrap();
 
         let mut p =
-            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false).unwrap();
+            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false, StartAction::None).unwrap();
         p.cols = 80;
         p.rows = 24;
         let n0 = p.lines.len();
@@ -1664,6 +1721,16 @@ mod tests {
         p.apply_filters();
         let info = p.info_string();
         assert!(info.contains("[filtered 2/3]"), "got: {}", info);
+    }
+
+    #[test]
+    fn parse_plus_forms() {
+        assert!(matches!(parse_plus("G"), Some(StartAction::End)));
+        assert!(matches!(parse_plus("/foo"), Some(StartAction::Search(ref s)) if s == "foo"));
+        assert!(matches!(parse_plus("42"), Some(StartAction::Line(41)))); // 1-based -> 0-based
+        assert!(matches!(parse_plus("1"), Some(StartAction::Line(0))));
+        assert!(parse_plus("bogus").is_none());
+        assert!(parse_plus("").is_none());
     }
 }
 

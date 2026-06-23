@@ -5,17 +5,20 @@ use std::process::ExitCode;
 mod highlight;
 mod pager;
 
-use pager::Source;
+use pager::{Source, StartAction};
 
-const USAGE: &str = "usage: cless [-S] [-N] <file>...";
+const USAGE: &str = "usage: cless [-S] [-N] [-p pattern] [+cmd] <file>...";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let mut wrap = true;
     let mut numbers = false;
+    let mut start = StartAction::None;
     let mut paths: Vec<&str> = Vec::new();
-    for arg in &args[1..] {
-        match arg.as_str() {
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
             "-h" | "--help" => {
                 eprintln!("{}", USAGE);
                 return ExitCode::from(2);
@@ -24,6 +27,25 @@ fn main() -> ExitCode {
             "-S" => wrap = false,
             // -N: show line numbers, like less.
             "-N" => numbers = true,
+            // -p pattern: start at the first line matching pattern (= +/pattern).
+            "-p" => {
+                i += 1;
+                match args.get(i) {
+                    Some(pat) => start = StartAction::Search(pat.clone()),
+                    None => {
+                        eprintln!("cless: -p requires a pattern");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            // +cmd: startup positioning (+G end, +/pat search, +N line).
+            _ if arg.starts_with('+') => match pager::parse_plus(&arg[1..]) {
+                Some(a) => start = a,
+                None => {
+                    eprintln!("cless: unsupported start command: {}", arg);
+                    return ExitCode::from(2);
+                }
+            },
             // A lone `-` means stdin; longer dash args are unknown options.
             other if other.starts_with('-') && other.len() > 1 => {
                 eprintln!("cless: unknown option: {}", other);
@@ -31,6 +53,7 @@ fn main() -> ExitCode {
             }
             other => paths.push(other),
         }
+        i += 1;
     }
 
     // stdin: an explicit lone `-`, or no file with stdin piped in. crossterm
@@ -59,7 +82,7 @@ fn main() -> ExitCode {
         paths.iter().map(|p| Source::file(*p, *p)).collect()
     };
 
-    if let Err(e) = pager::run(sources, wrap, numbers) {
+    if let Err(e) = pager::run(sources, wrap, numbers, start) {
         eprintln!("cless: {}", e);
         return ExitCode::from(1);
     }
