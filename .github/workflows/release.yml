@@ -75,10 +75,15 @@ jobs:
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ${{ steps.package.outputs.asset }}
-          fail_on_unmatched_files: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Matrix jobs race to create the release; losing the race is fine,
+          # the upload targets the same release either way.
+          gh release create "$tag" --title "$tag" --verify-tag 2>/dev/null || true
+          gh release upload "$tag" "${{ steps.package.outputs.asset }}" --clobber
 
       - name: Upload as workflow artifact (manual run)
         if: github.event_name == 'workflow_dispatch'
