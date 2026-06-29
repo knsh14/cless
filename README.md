@@ -10,7 +10,7 @@ A `less`-like terminal pager with tree-sitter syntax highlighting.
 - **Marks, multi-file, and tail-follow**: `m`/`'` marks, `:n`/`:p` to switch files, `F` to follow a growing file (`tail -f`)
 - **Line wrapping** on by default (`-S` chops), optional line numbers (`-N`), startup positioning (`+N` / `+G` / `+/pat`, `-p pat`)
 - **stdin / pipes**: `cat file | cless` (keys still read from the terminal)
-- **Tree-sitter highlighting for 15 languages**: Rust, Python, JavaScript, TypeScript (incl. TSX), JSON, Go, Bash, TOML, YAML, HTML, CSS, C, Markdown
+- **Tree-sitter highlighting for 27 languages**: Rust, Python, JavaScript, TypeScript (incl. TSX), JSON, Go, Bash, TOML, YAML, HTML, CSS, C, C++, C#, Java, Kotlin, Swift, Ruby, PHP, Lua, Zig, SQL, HCL/Terraform, XML, INI, Makefile, Markdown
 - **citruszest palette** (from [zootedb0t/citruszest.nvim](https://github.com/zootedb0t/citruszest.nvim)) emitted as truecolor ANSI
 - Language detection: file extension → special filenames (`.bashrc` etc.) → shebang
 
@@ -39,7 +39,7 @@ cargo build --release   # target/release/cless
 
 Building from source requires a C compiler because each tree-sitter parser is written in C
 (macOS: `xcode-select --install`, Ubuntu: `apt install build-essential`).
-The release binary is ~10 MB.
+The release binary is ~32 MB.
 
 ## Usage
 

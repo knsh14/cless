@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-`cless` is a `less`-like terminal pager with tree-sitter syntax highlighting. Single Rust binary (Cargo, edition 2024). Release build is ~10 MB and requires a C compiler at build time (each tree-sitter parser is written in C).
+`cless` is a `less`-like terminal pager with tree-sitter syntax highlighting. Single Rust binary (Cargo, edition 2024). Release build is ~32 MB and requires a C compiler at build time (each tree-sitter parser is written in C).
 
 End users install via `cargo binstall cless`, which pulls a prebuilt binary from GitHub Releases. `.github/workflows/release.yml` builds and publishes binaries for five targets on every `v*` tag push.
 
@@ -18,7 +18,7 @@ src/
 
 ```sh
 cargo build                                       # debug
-cargo build --release                             # first run ~15s (15 C parsers to compile)
+cargo build --release                             # first run ~30s (28 C parsers to compile)
 cargo test                                        # pager::tests (render SGR, wrap_ranges, clamp_pos, gutter, marks, files, follow, build_view, visible accessors, filtered info, parse_plus)
 ./target/release/cless <file>...                  # wraps long lines; -S to chop, -N for line numbers
 ./target/release/cless +/pat -p pat +G +N <file>  # startup positioning (search / line / end)

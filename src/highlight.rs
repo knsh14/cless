@@ -112,9 +112,55 @@ enum Lang {
     Css,
     C,
     Markdown,
+    Cpp,
+    Java,
+    Ruby,
+    Php,
+    CSharp,
+    Lua,
+    Zig,
+    Make,
+    Hcl,
+    Xml,
+    Ini,
+    Kotlin,
+    Swift,
+    Sql,
 }
 
 impl Lang {
+    #[cfg(test)]
+    const ALL: &'static [Lang] = &[
+        Lang::Rust,
+        Lang::Python,
+        Lang::JavaScript,
+        Lang::TypeScript,
+        Lang::Tsx,
+        Lang::Json,
+        Lang::Go,
+        Lang::Bash,
+        Lang::Toml,
+        Lang::Yaml,
+        Lang::Html,
+        Lang::Css,
+        Lang::C,
+        Lang::Markdown,
+        Lang::Cpp,
+        Lang::Java,
+        Lang::Ruby,
+        Lang::Php,
+        Lang::CSharp,
+        Lang::Lua,
+        Lang::Zig,
+        Lang::Make,
+        Lang::Hcl,
+        Lang::Xml,
+        Lang::Ini,
+        Lang::Kotlin,
+        Lang::Swift,
+        Lang::Sql,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Lang::Rust => "rust",
@@ -131,6 +177,20 @@ impl Lang {
             Lang::Css => "css",
             Lang::C => "c",
             Lang::Markdown => "markdown",
+            Lang::Cpp => "cpp",
+            Lang::Java => "java",
+            Lang::Ruby => "ruby",
+            Lang::Php => "php",
+            Lang::CSharp => "c_sharp",
+            Lang::Lua => "lua",
+            Lang::Zig => "zig",
+            Lang::Make => "make",
+            Lang::Hcl => "hcl",
+            Lang::Xml => "xml",
+            Lang::Ini => "ini",
+            Lang::Kotlin => "kotlin",
+            Lang::Swift => "swift",
+            Lang::Sql => "sql",
         }
     }
 }
@@ -157,6 +217,20 @@ fn detect_language(path: &str, content: &str) -> Option<Lang> {
         "css" => return Some(Lang::Css),
         "c" | "h" => return Some(Lang::C),
         "md" | "markdown" => return Some(Lang::Markdown),
+        "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" => return Some(Lang::Cpp),
+        "java" => return Some(Lang::Java),
+        "rb" | "rake" | "gemspec" => return Some(Lang::Ruby),
+        "php" | "phtml" => return Some(Lang::Php),
+        "cs" => return Some(Lang::CSharp),
+        "lua" => return Some(Lang::Lua),
+        "zig" => return Some(Lang::Zig),
+        "mk" | "mak" => return Some(Lang::Make),
+        "hcl" | "tf" | "tfvars" => return Some(Lang::Hcl),
+        "xml" | "svg" | "xsl" | "xslt" | "xsd" | "plist" => return Some(Lang::Xml),
+        "ini" | "cfg" => return Some(Lang::Ini),
+        "kt" | "kts" => return Some(Lang::Kotlin),
+        "swift" => return Some(Lang::Swift),
+        "sql" => return Some(Lang::Sql),
         _ => {}
     }
 
@@ -171,6 +245,11 @@ fn detect_language(path: &str, content: &str) -> Option<Lang> {
     ) {
         return Some(Lang::Bash);
     }
+    match file_name.as_str() {
+        "makefile" | "gnumakefile" => return Some(Lang::Make),
+        "gemfile" | "rakefile" => return Some(Lang::Ruby),
+        _ => {}
+    }
 
     let first_line = content.lines().next().unwrap_or("");
     if let Some(rest) = first_line.strip_prefix("#!") {
@@ -180,6 +259,15 @@ fn detect_language(path: &str, content: &str) -> Option<Lang> {
         }
         if rest.contains("node") || rest.contains("deno") {
             return Some(Lang::JavaScript);
+        }
+        if rest.contains("ruby") {
+            return Some(Lang::Ruby);
+        }
+        if rest.contains("lua") {
+            return Some(Lang::Lua);
+        }
+        if rest.contains("php") {
+            return Some(Lang::Php);
         }
         if rest.contains("bash")
             || rest.contains("zsh")
@@ -192,6 +280,47 @@ fn detect_language(path: &str, content: &str) -> Option<Lang> {
 
     None
 }
+
+// tree-sitter-kotlin-ng and tree-sitter-hcl ship no highlights query, so a
+// compact one is vendored here. Only node types and tokens verified present in
+// each grammar are referenced; an unknown name would make the query fail to
+// compile and silently drop the language back to plain text.
+const KOTLIN_HIGHLIGHTS: &str = r#"
+[
+  "fun" "val" "var" "class" "object" "interface" "if" "else" "when"
+  "for" "while" "do" "return" "throw" "try" "catch" "finally"
+  "import" "package" "typealias" "in" "is" "as" "by" "where"
+  "enum" "sealed" "data" "override" "private" "public" "protected"
+  "internal" "abstract" "final" "open" "suspend" "companion"
+  "constructor" "init" "get" "set"
+] @keyword
+["this" "super"] @variable.builtin
+(user_type) @type
+(line_comment) @comment
+(block_comment) @comment
+(shebang) @comment
+(string_literal) @string
+(multiline_string_literal) @string
+(character_literal) @string
+(escape_sequence) @string.escape
+(number_literal) @number
+(float_literal) @number
+(label) @label
+"#;
+
+const HCL_HIGHLIGHTS: &str = r#"
+(comment) @comment
+(string_lit) @string
+(template_literal) @string
+(numeric_lit) @number
+(bool_lit) @constant.builtin
+(null_lit) @constant.builtin
+(block (identifier) @type)
+(function_call (identifier) @function)
+(attribute (identifier) @property)
+(get_attr (identifier) @property)
+(variable_expr (identifier) @variable)
+"#;
 
 fn build_config(lang: Lang) -> Option<HighlightConfiguration> {
     let (language, hl, inj, locals): (tree_sitter::Language, &str, &str, &str) = match lang {
@@ -277,6 +406,85 @@ fn build_config(lang: Lang) -> Option<HighlightConfiguration> {
             tree_sitter_md::LANGUAGE.into(),
             tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
             tree_sitter_md::INJECTION_QUERY_BLOCK,
+            "",
+        ),
+        Lang::Cpp => (
+            tree_sitter_cpp::LANGUAGE.into(),
+            tree_sitter_cpp::HIGHLIGHT_QUERY,
+            "",
+            "",
+        ),
+        Lang::Java => (
+            tree_sitter_java::LANGUAGE.into(),
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Ruby => (
+            tree_sitter_ruby::LANGUAGE.into(),
+            tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Php => (
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            tree_sitter_php::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::CSharp => (
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Lua => (
+            tree_sitter_lua::LANGUAGE.into(),
+            tree_sitter_lua::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Zig => (
+            tree_sitter_zig::LANGUAGE.into(),
+            tree_sitter_zig::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Make => (
+            tree_sitter_make::LANGUAGE.into(),
+            tree_sitter_make::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Hcl => (tree_sitter_hcl::LANGUAGE.into(), HCL_HIGHLIGHTS, "", ""),
+        Lang::Xml => (
+            tree_sitter_xml::LANGUAGE_XML.into(),
+            tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+            "",
+            "",
+        ),
+        Lang::Ini => (
+            tree_sitter_ini::LANGUAGE.into(),
+            tree_sitter_ini::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Kotlin => (
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            KOTLIN_HIGHLIGHTS,
+            "",
+            "",
+        ),
+        Lang::Swift => (
+            tree_sitter_swift::LANGUAGE.into(),
+            tree_sitter_swift::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lang::Sql => (
+            tree_sitter_sequel::LANGUAGE.into(),
+            tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            "",
             "",
         ),
     };
@@ -425,6 +633,21 @@ mod tests {
         assert_eq!(plain(&lines)[1], "        let x = 1;");
     }
 
+    /// Every language must build a valid HighlightConfiguration. This catches a
+    /// crate whose query constant was renamed, a grammar/core ABI mismatch, or a
+    /// vendored query (Kotlin, HCL) that references a node type the grammar does
+    /// not have — all of which otherwise degrade silently to plain text.
+    #[test]
+    fn every_language_builds_a_config() {
+        for &lang in Lang::ALL {
+            assert!(
+                build_config(lang).is_some(),
+                "build_config failed for {}",
+                lang.name()
+            );
+        }
+    }
+
     /// Smoke test for the tree-sitter parse + highlight path: catches a broken
     /// grammar/core ABI after a tree-sitter dependency bump (the build alone
     /// only proves the Rust API matches, not that parsing produces highlights).
@@ -454,6 +677,33 @@ mod tests {
             colors.len() > 1,
             "expected multiple highlight colors, got {:?}",
             colors
+        );
+    }
+
+    fn distinct_colors(lines: &[Line]) -> usize {
+        lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|(s, _)| (s.foreground.r, s.foreground.g, s.foreground.b))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// The Kotlin and HCL highlight queries are hand-vendored (their crates ship
+    /// none), so a query that compiles but matches nothing would still leave the
+    /// file uncolored. Assert real code actually produces more than one color.
+    #[test]
+    fn vendored_queries_highlight_real_code() {
+        let kotlin = "fun main() {\n    val x = 42\n    // hi\n}\n";
+        assert!(
+            distinct_colors(&highlight_file(kotlin, "demo.kt")) > 1,
+            "kotlin produced no highlights"
+        );
+
+        let hcl = "resource \"aws_s3_bucket\" \"b\" {\n  bucket = \"x\" # note\n  count  = 3\n}\n";
+        assert!(
+            distinct_colors(&highlight_file(hcl, "demo.tf")) > 1,
+            "hcl produced no highlights"
         );
     }
 }
