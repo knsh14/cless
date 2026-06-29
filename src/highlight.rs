@@ -327,13 +327,9 @@ pub fn highlight_file(content: &str, path: &str) -> Vec<Line> {
     }
 
     lines.push(current);
-    if lines.is_empty() {
-        lines.push(Vec::new());
-    }
-    if lines.len() >= 2
-        && lines.last().map(|l| l.is_empty()).unwrap_or(false)
-        && content.ends_with('\n')
-    {
+    // Drop the phantom empty line a trailing newline produces (but keep the
+    // single empty line of empty input).
+    if lines.len() >= 2 && content.ends_with('\n') && lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
 

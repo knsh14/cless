@@ -12,7 +12,7 @@ use crossterm::{
 use regex::{Regex, RegexBuilder};
 use unicode_width::UnicodeWidthChar;
 
-use crate::highlight::{Line, highlight_file};
+use crate::highlight::{Color, Line, highlight_file};
 
 /// An input the pager can display. Files are read and highlighted lazily on
 /// switch; stdin content is pre-highlighted (it cannot be re-read).
@@ -111,11 +111,42 @@ struct Filter {
     negate: bool,
 }
 
+/// Smart-case regex like less: case-insensitive unless the pattern contains an
+/// uppercase character. Shared by search, filters, and `+/pat` / `-p`.
+fn smartcase_regex(pat: &str) -> Result<Regex, regex::Error> {
+    let insensitive = pat.chars().all(|c| !c.is_uppercase());
+    RegexBuilder::new(pat).case_insensitive(insensitive).build()
+}
+
 enum Mode {
     Normal,
     SearchInput { dir: SearchDir, buffer: String },
     FilterInput { buffer: String },
     Help,
+}
+
+/// One keystroke applied to a prompt buffer (search or filter input).
+/// Backspacing past an empty buffer cancels the prompt, like less.
+enum PromptKey {
+    Submit(String),
+    Cancel,
+    Keep(String),
+}
+
+fn prompt_key(mut buffer: String, k: KeyEvent) -> PromptKey {
+    match (k.code, k.modifiers) {
+        (KeyCode::Enter, _) => PromptKey::Submit(buffer),
+        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => PromptKey::Cancel,
+        (KeyCode::Backspace, _) => match buffer.pop() {
+            None => PromptKey::Cancel,
+            Some(_) => PromptKey::Keep(buffer),
+        },
+        (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+            buffer.push(c);
+            PromptKey::Keep(buffer)
+        }
+        _ => PromptKey::Keep(buffer),
+    }
 }
 
 /// A keystroke that expects a follow-up key. Replaces a pile of parallel
@@ -336,18 +367,22 @@ impl Pager {
         clamp_pos(&self.lines, self.content_cols(), self.wrap, top, sub)
     }
 
+    /// Adopt a target position, snapped onto a visible line and clamped so the
+    /// final screenful stays at the bottom.
+    fn move_to(&mut self, top: usize, sub: usize) {
+        (self.top, self.sub) = self.clamp_view(top, sub).min(self.max_scroll());
+    }
+
     /// Rebuild the visible-line cache from `filters` and pull the scroll
     /// position back onto a visible line.
     fn apply_filters(&mut self) {
         self.view = build_view(&self.lines, &self.filters);
-        let p = self.clamp_view(self.top, 0);
-        (self.top, self.sub) = p.min(self.max_scroll());
+        self.move_to(self.top, 0);
     }
 
     /// Jump to the top of source line `line`, clamped into range.
     fn goto_line(&mut self, line: usize) {
-        let p = self.clamp_view(line, 0).min(self.max_scroll());
-        (self.top, self.sub) = p;
+        self.move_to(line, 0);
     }
 
     fn goto_end(&mut self) {
@@ -356,10 +391,8 @@ impl Pager {
 
     /// Jump to a saved position, remembering the current one for `''`.
     fn jump_to(&mut self, pos: (usize, usize)) {
-        let cur = (self.top, self.sub);
-        let p = self.clamp_view(pos.0, pos.1).min(self.max_scroll());
-        self.prev_pos = Some(cur);
-        (self.top, self.sub) = p;
+        self.prev_pos = Some((self.top, self.sub));
+        self.move_to(pos.0, pos.1);
     }
 
     fn goto_mark(&mut self, c: char) {
@@ -389,8 +422,7 @@ impl Pager {
         self.wrap = !self.wrap;
         self.left = 0;
         // Keep the current line in view; drop the sub-row offset.
-        let p = self.clamp_view(self.top, 0).min(self.max_scroll());
-        (self.top, self.sub) = p;
+        self.move_to(self.top, 0);
         self.message = Some(
             if self.wrap {
                 "Wrap long lines"
@@ -404,8 +436,7 @@ impl Pager {
     fn toggle_numbers(&mut self) {
         self.numbers = !self.numbers;
         // Gutter changes the content width, so re-clamp the position.
-        let p = self.clamp_view(self.top, self.sub).min(self.max_scroll());
-        (self.top, self.sub) = p;
+        self.move_to(self.top, self.sub);
         self.message = Some(
             if self.numbers {
                 "Line numbers"
@@ -421,13 +452,9 @@ impl Pager {
         let (c, r) = terminal::size()?;
         self.cols = c as usize;
         self.rows = r.max(2) as usize;
-        // Resize may shrink a line's wrap-segment count; guard `sub` first
-        // (avoids indexing past the end), then keep the end on-screen.
-        (self.top, self.sub) = self.clamp_view(self.top, self.sub);
-        let max = self.max_scroll();
-        if (self.top, self.sub) > max {
-            (self.top, self.sub) = max;
-        }
+        // Resize may shrink a line's wrap-segment count; re-clamping guards
+        // `sub` against indexing past the end and keeps the end on-screen.
+        self.move_to(self.top, self.sub);
         Ok(())
     }
 
@@ -438,16 +465,7 @@ impl Pager {
             StartAction::None => {}
             StartAction::Line(n) => self.goto_line(n),
             StartAction::End => self.goto_end(),
-            StartAction::Search(pat) => {
-                let smart_case = pat.chars().all(|c| !c.is_uppercase());
-                match RegexBuilder::new(&pat).case_insensitive(smart_case).build() {
-                    Ok(re) => {
-                        self.search = Some(SearchState { re, dir: SearchDir::Forward });
-                        self.do_search(SearchDir::Forward, false);
-                    }
-                    Err(e) => self.message = Some(format!("Invalid regex: {}", e)),
-                }
-            }
+            StartAction::Search(pat) => self.set_search(&pat, SearchDir::Forward),
         }
     }
 
@@ -611,19 +629,19 @@ impl Pager {
         }
 
         // Digit prefix.
-        if let KeyCode::Char(c @ '0'..='9') = k.code {
-            if k.modifiers == KeyModifiers::NONE || k.modifiers == KeyModifiers::SHIFT {
-                let d = (c as u8 - b'0') as usize;
-                if !(d == 0 && self.count.is_none()) {
-                    self.count = Some(
-                        self.count
-                            .unwrap_or(0)
-                            .saturating_mul(10)
-                            .saturating_add(d),
-                    );
-                }
-                return false;
+        if let KeyCode::Char(c @ '0'..='9') = k.code
+            && (k.modifiers == KeyModifiers::NONE || k.modifiers == KeyModifiers::SHIFT)
+        {
+            let d = (c as u8 - b'0') as usize;
+            if !(d == 0 && self.count.is_none()) {
+                self.count = Some(
+                    self.count
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(d),
+                );
             }
+            return false;
         }
 
         let mut consume = true;
@@ -799,7 +817,7 @@ impl Pager {
     }
 
     fn handle_search_input(&mut self, k: KeyEvent) {
-        let (dir, mut buffer) = match std::mem::replace(&mut self.mode, Mode::Normal) {
+        let (dir, buffer) = match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::SearchInput { dir, buffer } => (dir, buffer),
             other => {
                 self.mode = other;
@@ -807,48 +825,31 @@ impl Pager {
             }
         };
 
-        match (k.code, k.modifiers) {
-            (KeyCode::Enter, _) => {
-                if buffer.is_empty() {
-                    return;
-                }
-                let smart_case = buffer.chars().all(|c| !c.is_uppercase());
-                match RegexBuilder::new(&buffer)
-                    .case_insensitive(smart_case)
-                    .build()
-                {
-                    Ok(re) => {
-                        self.search = Some(SearchState { re, dir });
-                        self.message = None;
-                        self.do_search(dir, false);
-                    }
-                    Err(e) => {
-                        self.message = Some(format!("Invalid regex: {}", e));
-                    }
+        match prompt_key(buffer, k) {
+            PromptKey::Submit(buffer) => {
+                if !buffer.is_empty() {
+                    self.set_search(&buffer, dir);
                 }
             }
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            PromptKey::Cancel => self.message = None,
+            PromptKey::Keep(buffer) => self.mode = Mode::SearchInput { dir, buffer },
+        }
+    }
+
+    /// Compile `pat` (smart-case) as the active search and run it once.
+    fn set_search(&mut self, pat: &str, dir: SearchDir) {
+        match smartcase_regex(pat) {
+            Ok(re) => {
+                self.search = Some(SearchState { re, dir });
                 self.message = None;
+                self.do_search(dir, false);
             }
-            (KeyCode::Backspace, _) => {
-                if buffer.pop().is_none() {
-                    self.message = None;
-                } else {
-                    self.mode = Mode::SearchInput { dir, buffer };
-                }
-            }
-            (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
-                buffer.push(c);
-                self.mode = Mode::SearchInput { dir, buffer };
-            }
-            _ => {
-                self.mode = Mode::SearchInput { dir, buffer };
-            }
+            Err(e) => self.message = Some(format!("Invalid regex: {}", e)),
         }
     }
 
     fn handle_filter_input(&mut self, k: KeyEvent) {
-        let mut buffer = match std::mem::replace(&mut self.mode, Mode::Normal) {
+        let buffer = match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::FilterInput { buffer } => buffer,
             other => {
                 self.mode = other;
@@ -856,49 +857,33 @@ impl Pager {
             }
         };
 
-        match (k.code, k.modifiers) {
-            (KeyCode::Enter, _) => {
-                if buffer.is_empty() {
-                    self.filters.clear();
-                    self.apply_filters();
-                    self.message = Some("Filter cleared".to_string());
-                    return;
-                }
-                // A leading `!` negates: show lines that do NOT match.
-                let (negate, pat) = match buffer.strip_prefix('!') {
-                    Some(rest) => (true, rest),
-                    None => (false, buffer.as_str()),
-                };
-                let smart_case = pat.chars().all(|c| !c.is_uppercase());
-                match RegexBuilder::new(pat)
-                    .case_insensitive(smart_case)
-                    .build()
-                {
-                    Ok(re) => {
-                        self.filters.push(Filter { re, negate });
-                        self.apply_filters();
-                        self.message = None;
-                    }
-                    Err(e) => self.message = Some(format!("Invalid regex: {}", e)),
-                }
-            }
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+        match prompt_key(buffer, k) {
+            PromptKey::Submit(buffer) => self.submit_filter(&buffer),
+            PromptKey::Cancel => self.message = None,
+            PromptKey::Keep(buffer) => self.mode = Mode::FilterInput { buffer },
+        }
+    }
+
+    /// `&pat` adds a filter, `&!pat` a negated one (show lines that do NOT
+    /// match), and an empty `&` clears all filters.
+    fn submit_filter(&mut self, buffer: &str) {
+        if buffer.is_empty() {
+            self.filters.clear();
+            self.apply_filters();
+            self.message = Some("Filter cleared".to_string());
+            return;
+        }
+        let (negate, pat) = match buffer.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, buffer),
+        };
+        match smartcase_regex(pat) {
+            Ok(re) => {
+                self.filters.push(Filter { re, negate });
+                self.apply_filters();
                 self.message = None;
             }
-            (KeyCode::Backspace, _) => {
-                if buffer.pop().is_none() {
-                    self.message = None;
-                } else {
-                    self.mode = Mode::FilterInput { buffer };
-                }
-            }
-            (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
-                buffer.push(c);
-                self.mode = Mode::FilterInput { buffer };
-            }
-            _ => {
-                self.mode = Mode::FilterInput { buffer };
-            }
+            Err(e) => self.message = Some(format!("Invalid regex: {}", e)),
         }
     }
 
@@ -966,11 +951,8 @@ impl Pager {
     fn info_string(&self) -> String {
         let total = self.lines.len();
         let last = (self.bottom_line() + 1).min(total);
-        let pct = if total == 0 {
-            100
-        } else {
-            (last * 100 / total).min(100)
-        };
+        // An empty file reads as fully shown (100%).
+        let pct = (last * 100).checked_div(total).unwrap_or(100).min(100);
         let base = format!(
             "{}  lines {}-{}/{}  {}%",
             self.name,
@@ -1061,25 +1043,10 @@ impl Pager {
         match &self.mode {
             Mode::SearchInput { dir, buffer } => {
                 let prompt = if *dir == SearchDir::Forward { '/' } else { '?' };
-                out.write_all(format!("{}{}", prompt, buffer).as_bytes())?;
-                // Show input cursor.
-                queue!(out, cursor::Show)?;
-                queue!(
-                    out,
-                    cursor::MoveTo((buffer.len() + 1).min(self.cols) as u16, body as u16)
-                )?;
-                out.flush()?;
-                return Ok(());
+                return self.draw_prompt(&mut out, prompt, buffer, body);
             }
             Mode::FilterInput { buffer } => {
-                out.write_all(format!("&{}", buffer).as_bytes())?;
-                queue!(out, cursor::Show)?;
-                queue!(
-                    out,
-                    cursor::MoveTo((buffer.len() + 1).min(self.cols) as u16, body as u16)
-                )?;
-                out.flush()?;
-                return Ok(());
+                return self.draw_prompt(&mut out, '&', buffer, body);
             }
             Mode::Help => unreachable!(),
             Mode::Normal => {
@@ -1100,6 +1067,24 @@ impl Pager {
             }
         }
 
+        out.flush()
+    }
+
+    /// Render an input prompt on the status row, with a visible cursor after
+    /// the buffer text.
+    fn draw_prompt<W: Write>(
+        &self,
+        out: &mut W,
+        prompt: char,
+        buffer: &str,
+        row: usize,
+    ) -> io::Result<()> {
+        out.write_all(format!("{}{}", prompt, buffer).as_bytes())?;
+        queue!(out, cursor::Show)?;
+        queue!(
+            out,
+            cursor::MoveTo((buffer.len() + 1).min(self.cols) as u16, row as u16)
+        )?;
         out.flush()
     }
 
@@ -1371,6 +1356,97 @@ fn truncate_pad(s: &mut String, cols: usize) {
     *s = keep;
 }
 
+/// Non-empty search-match byte ranges over a line's plain text.
+fn match_ranges(plain: &str, search: Option<&SearchState>) -> Vec<(usize, usize)> {
+    let Some(s) = search else { return Vec::new() };
+    s.re
+        .find_iter(plain)
+        .map(|m| (m.start(), m.end()))
+        .filter(|(a, b)| b > a)
+        .collect()
+}
+
+/// Accumulates rendered characters, emitting a full `\x1b[0(;7);38;2;R;G;Bm`
+/// SGR only when the style changes (the complete form keeps inverse video
+/// reliable on older terminals) and a final reset only if anything was written.
+struct SgrOut {
+    out: String,
+    prev_sgr: Option<String>,
+}
+
+impl SgrOut {
+    fn new() -> Self {
+        SgrOut {
+            out: String::new(),
+            prev_sgr: None,
+        }
+    }
+
+    fn push(&mut self, ch: char, fg: Color, invert: bool) {
+        let inv = if invert { ";7" } else { "" };
+        let sgr = format!("\x1b[0{};38;2;{};{};{}m", inv, fg.r, fg.g, fg.b);
+        if self.prev_sgr.as_deref() != Some(sgr.as_str()) {
+            self.out.push_str(&sgr);
+            self.prev_sgr = Some(sgr);
+        }
+        self.out.push(ch);
+    }
+
+    fn finish(mut self) -> String {
+        if self.prev_sgr.is_some() {
+            self.out.push_str("\x1b[0m");
+        }
+        self.out
+    }
+}
+
+/// Render one wrap segment (a byte range from `wrap_ranges`) of a line, with
+/// syntax colors and search-match inverse video, terminated by a reset.
+fn render_segment(line: &Line, range: (usize, usize), search: Option<&SearchState>) -> String {
+    let (start, end) = range;
+    let plain = line_plain(line);
+    let matches = match_ranges(&plain, search);
+    let in_match = |byte: usize| matches.iter().any(|&(a, b)| byte >= a && byte < b);
+
+    let mut out = SgrOut::new();
+    let mut byte_pos: usize = 0;
+    for (style, text) in &line.spans {
+        for ch in text.chars() {
+            if byte_pos >= start && byte_pos < end && UnicodeWidthChar::width(ch).unwrap_or(0) > 0 {
+                out.push(ch, style.foreground, in_match(byte_pos));
+            }
+            byte_pos += ch.len_utf8();
+        }
+    }
+    out.finish()
+}
+
+/// Render a whole line for chop mode: the column window `[left, left+cols)`,
+/// with syntax colors and search-match inverse video, terminated by a reset.
+fn render_line(line: &Line, left: usize, cols: usize, search: Option<&SearchState>) -> String {
+    let plain = line_plain(line);
+    let matches = match_ranges(&plain, search);
+    let in_match = |byte: usize| matches.iter().any(|&(a, b)| byte >= a && byte < b);
+
+    let end = left.saturating_add(cols);
+    let mut out = SgrOut::new();
+    let mut col: usize = 0;
+    let mut byte_pos: usize = 0;
+    for (style, text) in &line.spans {
+        for ch in text.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            // A char must fit entirely inside the window; a wide char
+            // straddling either edge is dropped rather than half-drawn.
+            if cw > 0 && col >= left && col + cw <= end {
+                out.push(ch, style.foreground, in_match(byte_pos));
+            }
+            col += cw;
+            byte_pos += ch.len_utf8();
+        }
+    }
+    out.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,9 +1471,8 @@ mod tests {
     }
 
     fn filt(pat: &str, negate: bool) -> Filter {
-        let smart = pat.chars().all(|c| !c.is_uppercase());
         Filter {
-            re: RegexBuilder::new(pat).case_insensitive(smart).build().unwrap(),
+            re: smartcase_regex(pat).unwrap(),
             negate,
         }
     }
@@ -1732,106 +1807,4 @@ mod tests {
         assert!(parse_plus("bogus").is_none());
         assert!(parse_plus("").is_none());
     }
-}
-
-/// Render one wrap segment (a byte range from `wrap_ranges`) of a line, with
-/// syntax colors and search-match inverse video, terminated by a reset.
-fn render_segment(line: &Line, range: (usize, usize), search: Option<&SearchState>) -> String {
-    let (start, end) = range;
-    let plain = line_plain(line);
-    let matches: Vec<(usize, usize)> = if let Some(s) = search {
-        s.re
-            .find_iter(&plain)
-            .map(|m| (m.start(), m.end()))
-            .filter(|(a, b)| b > a)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let in_match = |byte: usize| matches.iter().any(|&(a, b)| byte >= a && byte < b);
-
-    let mut out = String::new();
-    let mut byte_pos: usize = 0;
-    let mut prev_sgr: Option<String> = None;
-    let mut any_emitted = false;
-
-    for (style, text) in &line.spans {
-        let fg = style.foreground;
-        for ch in text.chars() {
-            let ch_len = ch.len_utf8();
-            if byte_pos >= start && byte_pos < end && UnicodeWidthChar::width(ch).unwrap_or(0) > 0 {
-                let sgr = if in_match(byte_pos) {
-                    format!("\x1b[0;7;38;2;{};{};{}m", fg.r, fg.g, fg.b)
-                } else {
-                    format!("\x1b[0;38;2;{};{};{}m", fg.r, fg.g, fg.b)
-                };
-                if prev_sgr.as_deref() != Some(sgr.as_str()) {
-                    out.push_str(&sgr);
-                    prev_sgr = Some(sgr);
-                }
-                out.push(ch);
-                any_emitted = true;
-            }
-            byte_pos += ch_len;
-        }
-    }
-    if any_emitted {
-        out.push_str("\x1b[0m");
-    }
-    out
-}
-
-fn render_line(line: &Line, left: usize, cols: usize, search: Option<&SearchState>) -> String {
-    let plain = line_plain(line);
-    let matches: Vec<(usize, usize)> = if let Some(s) = search {
-        s.re
-            .find_iter(&plain)
-            .map(|m| (m.start(), m.end()))
-            .filter(|(a, b)| b > a)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let in_match = |byte: usize| matches.iter().any(|&(a, b)| byte >= a && byte < b);
-
-    let mut out = String::new();
-    let start = left;
-    let end = left.saturating_add(cols);
-    let mut col: usize = 0;
-    let mut byte_pos: usize = 0;
-    let mut prev_sgr: Option<String> = None;
-    let mut any_emitted = false;
-
-    for (style, text) in &line.spans {
-        let fg = style.foreground;
-        for ch in text.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            let ch_len = ch.len_utf8();
-            if col + cw > end {
-                col += cw;
-                byte_pos += ch_len;
-                continue;
-            }
-            if col >= start && cw > 0 {
-                let invert = in_match(byte_pos);
-                let sgr = if invert {
-                    format!("\x1b[0;7;38;2;{};{};{}m", fg.r, fg.g, fg.b)
-                } else {
-                    format!("\x1b[0;38;2;{};{};{}m", fg.r, fg.g, fg.b)
-                };
-                if prev_sgr.as_deref() != Some(sgr.as_str()) {
-                    out.push_str(&sgr);
-                    prev_sgr = Some(sgr);
-                }
-                out.push(ch);
-                any_emitted = true;
-            }
-            col += cw;
-            byte_pos += ch_len;
-        }
-    }
-    if any_emitted {
-        out.push_str("\x1b[0m");
-    }
-    out
 }

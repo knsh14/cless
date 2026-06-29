@@ -61,7 +61,7 @@ fn main() -> ExitCode {
     // can't be re-read for `:n`/`:p`).
     let read_stdin =
         (paths.is_empty() && !std::io::stdin().is_terminal()) || (paths == ["-"]);
-    if !read_stdin && paths.iter().any(|p| *p == "-") {
+    if !read_stdin && paths.contains(&"-") {
         eprintln!("cless: '-' (stdin) cannot be combined with files");
         return ExitCode::from(2);
     }
