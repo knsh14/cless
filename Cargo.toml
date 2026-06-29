@@ -11,7 +11,10 @@ keywords = ["less", "pager", "syntax-highlighting", "tree-sitter", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
-crossterm = "0.29"
+# use-dev-tty: poll /dev/tty via select instead of mio/kqueue, which cannot
+# poll /dev/tty on macOS — without it, any run with piped stdin (`cat f |
+# cless`, `... | xargs cless`) dies with "Failed to initialize input reader".
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 unicode-width = "0.2"
 regex = "1"
 
