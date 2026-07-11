@@ -40,12 +40,21 @@ git push origin v0.1.0
 
 This repo is managed with **jj (Jujutsu)** in a **colocated** layout (`.git` and `.jj` coexist; `.jj` is git-ignored). GitButler is no longer used. Standard git tooling (`cargo`, CI, `git tag`) still works unchanged.
 
+Standard daily loop (trunk-only: `main` bookmark + `v*` tags, no feature branches):
+
 ```sh
 jj new main                       # start work on top of main
-jj st / jj diff                   # inspect the working-copy commit (@); no add/stage
+# ...edit; jj auto-snapshots the working copy (no add/stage)...
+jj st / jj diff                   # inspect the working-copy commit (@)
 jj describe -m "feat(pager): …"   # set the commit message
-jj bookmark set main -r @         # advance the main bookmark to @
+jj new                            # finish; the completed change is now @-
+jj bookmark set main -r @-        # advance main to the completed change
 jj git push                       # push to origin (jj uses bookmarks, not branches)
+```
+
+Always finish with `jj new` *before* advancing main: commits reachable from `main@origin` are immutable, so if `main` is set to `@` and pushed, the working-copy commit itself becomes immutable and the next edit errors out. Keeping `@` as an empty scratch change on top avoids this.
+
+```sh
 jj git fetch                      # local main auto-updates (main@origin is tracked)
 jj undo                           # undo the last operation (jj op log for history)
 ```
