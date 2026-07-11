@@ -67,7 +67,8 @@ Releases still use git tags directly: `git tag v0.1.0 && git push origin v0.1.0`
 
 - `detect_language(path, content)` — extension → special filenames (`.bashrc` etc.) → shebang (`#!/usr/bin/env python` etc.)
 - `build_config(lang)` — pulls `LANGUAGE` / `HIGHLIGHTS_QUERY` / `INJECTIONS_QUERY` from each language crate, builds a `HighlightConfiguration`, calls `.configure()` with the 26 entries in `HIGHLIGHT_NAMES`
-- `highlight_file(content, path)` — walks the `Highlighter::highlight` event stream with a scope stack, splits spans on newlines, returns `Vec<Line>`
+- `highlight_file(content, path)` — walks the `Highlighter::highlight` event stream with a scope stack, splits spans on newlines, returns `Vec<Line>`. A mid-stream highlight error appends the remaining content unhighlighted rather than truncating the file.
+- Tabs are expanded to 8-column stops at load time (`push_text`), because the renderer draws only width>0 chars. Consequence: a search regex `\t` won't match; spaces will.
 - Palette is citruszest ([zootedb0t/citruszest.nvim](https://github.com/zootedb0t/citruszest.nvim)). Mapping lives in the `FG_*` constants and `color_for(name)`.
 
 ### `pager.rs`

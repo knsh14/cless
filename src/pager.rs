@@ -509,19 +509,22 @@ impl Pager {
 
     /// `F`: tail-follow the current file (stdin can't be re-read).
     fn start_follow(&mut self) {
-        let path = match &self.sources[self.index].kind {
-            SourceKind::File(p) => p.clone(),
-            SourceKind::Memory(_) => {
-                self.message = Some("Cannot follow stdin".to_string());
-                return;
-            }
-        };
-        self.follow_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        self.following = true;
+        if matches!(self.sources[self.index].kind, SourceKind::Memory(_)) {
+            self.message = Some("Cannot follow stdin".to_string());
+            return;
+        }
         self.filters.clear();
         self.apply_filters();
-        self.goto_end();
-        self.message = Some("Waiting for data... (any key to stop)".to_string());
+        self.following = true;
+        // The file may have changed since the last load; the sentinel makes
+        // poll_growth reload now, so F reflects the current content instead
+        // of waiting for the *next* size change.
+        self.follow_len = u64::MAX;
+        let _ = self.poll_growth();
+        if self.following {
+            self.goto_end();
+            self.message = Some("Waiting for data... (any key to stop)".to_string());
+        }
     }
 
     /// While following, reload + re-highlight the file when its size changes
@@ -649,7 +652,7 @@ impl Pager {
         match (k.code, k.modifiers) {
             // ---- Quit
             (KeyCode::Char('q'), KeyModifiers::NONE)
-            | (KeyCode::Char('Q'), KeyModifiers::SHIFT) => return true,
+            | (KeyCode::Char('Q'), _) => return true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
             (KeyCode::Char('Z'), _) => {
                 if pending == Pending::Z {
@@ -763,20 +766,19 @@ impl Pager {
                 }
             }
 
-            // ---- Search
+            // ---- Search (consumes the count: N-th match is not implemented,
+            // so it must not leak into the next command)
             (KeyCode::Char('/'), _) => {
                 self.mode = Mode::SearchInput {
                     dir: SearchDir::Forward,
                     buffer: String::new(),
                 };
-                consume = false;
             }
             (KeyCode::Char('?'), _) => {
                 self.mode = Mode::SearchInput {
                     dir: SearchDir::Backward,
                     buffer: String::new(),
                 };
-                consume = false;
             }
             (KeyCode::Char('n'), KeyModifiers::NONE) => self.repeat_search(false),
             (KeyCode::Char('N'), _) => self.repeat_search(true),
@@ -786,7 +788,6 @@ impl Pager {
                 self.mode = Mode::FilterInput {
                     buffer: String::new(),
                 };
-                consume = false;
             }
 
             // ---- Repaint (no-op; loop always redraws)
@@ -802,7 +803,6 @@ impl Pager {
             // ---- Help
             (KeyCode::Char('h'), KeyModifiers::NONE) | (KeyCode::Char('H'), _) => {
                 self.mode = Mode::Help;
-                consume = false;
             }
 
             _ => {
@@ -1081,9 +1081,18 @@ impl Pager {
     ) -> io::Result<()> {
         out.write_all(format!("{}{}", prompt, buffer).as_bytes())?;
         queue!(out, cursor::Show)?;
+        // Display width, not byte length: multibyte input would push the
+        // cursor past the typed text.
+        let width: usize = buffer
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
         queue!(
             out,
-            cursor::MoveTo((buffer.len() + 1).min(self.cols) as u16, row as u16)
+            cursor::MoveTo(
+                (width + 1).min(self.cols.saturating_sub(1)) as u16,
+                row as u16
+            )
         )?;
         out.flush()
     }
@@ -1783,6 +1792,57 @@ mod tests {
 
         // No further change => no redraw requested.
         assert!(!p.poll_growth().unwrap());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// A digit prefix must not leak past a prompt: `5` then `/pat` then `j`
+    /// would otherwise scroll 5 lines (the count belongs to the search, which
+    /// does not implement N-th match).
+    #[test]
+    fn count_cleared_when_entering_prompts() {
+        for prompt in ['/', '?', '&', 'h'] {
+            let mut p = pager_with(100);
+            p.handle_key(key('5'));
+            assert_eq!(p.count, Some(5));
+            p.handle_key(key(prompt));
+            assert_eq!(p.count, None, "count leaked past {:?}", prompt);
+        }
+    }
+
+    /// `Q` must quit even when the terminal reports no SHIFT modifier
+    /// (caps lock, some terminals).
+    #[test]
+    fn uppercase_q_quits_without_shift_modifier() {
+        let mut p = pager_with(10);
+        assert!(p.handle_key(key('Q')));
+    }
+
+    /// `F` must show the file's *current* content: a change between the last
+    /// load and pressing F would otherwise never be picked up (size polling
+    /// only sees changes after `follow_len` was recorded).
+    #[test]
+    fn start_follow_reloads_changes_since_load() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!("cless_followsync_{}.txt", std::process::id()));
+        std::fs::write(&path, "line1\n").unwrap();
+        let mut p =
+            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false, StartAction::None).unwrap();
+        p.cols = 80;
+        p.rows = 24;
+        assert_eq!(p.lines.len(), 1);
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "line2").unwrap();
+        drop(f);
+
+        p.start_follow();
+        assert!(p.following);
+        assert_eq!(p.lines.len(), 2, "F must reload content changed since load");
 
         std::fs::remove_file(&path).ok();
     }

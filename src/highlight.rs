@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Copy, Default)]
 pub struct Color {
@@ -299,6 +300,9 @@ pub fn highlight_file(content: &str, path: &str) -> Vec<Line> {
         let mut stack: Vec<usize> = Vec::new();
         match highlighter.highlight(&config, content.as_bytes(), None, |_| None) {
             Ok(events) => {
+                // Bytes emitted so far: a mid-stream error must not silently
+                // truncate the file, so the un-emitted tail is appended plain.
+                let mut consumed = 0usize;
                 for event in events {
                     match event {
                         Ok(HighlightEvent::HighlightStart(h)) => stack.push(h.0),
@@ -306,7 +310,7 @@ pub fn highlight_file(content: &str, path: &str) -> Vec<Line> {
                             stack.pop();
                         }
                         Ok(HighlightEvent::Source { start, end }) => {
-                            let text = &content[start..end];
+                            let text = content.get(start..end).unwrap_or("");
                             let style = stack
                                 .last()
                                 .and_then(|&i| HIGHLIGHT_NAMES.get(i).copied())
@@ -315,9 +319,14 @@ pub fn highlight_file(content: &str, path: &str) -> Vec<Line> {
                                 })
                                 .unwrap_or(default_style);
                             push_text(&mut current, &mut lines, text, style);
+                            consumed = end.max(consumed);
                         }
                         Err(_) => break,
                     }
+                }
+                if consumed < content.len() {
+                    let tail = content.get(consumed..).unwrap_or("");
+                    push_text(&mut current, &mut lines, tail, default_style);
                 }
             }
             Err(_) => push_text(&mut current, &mut lines, content, default_style),
@@ -348,7 +357,32 @@ fn push_text(
             lines.push(std::mem::take(current));
         }
         first = false;
-        let cleaned: String = piece.chars().filter(|c| *c != '\r').collect();
+        // Display column at the end of the line so far: tab stops depend on
+        // it, and a span can start mid-line.
+        let mut col: usize = current
+            .iter()
+            .flat_map(|(_, t)| t.chars())
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        let mut cleaned = String::new();
+        for ch in piece.chars() {
+            match ch {
+                '\r' => {}
+                // Expand tabs to 8-column stops here so the renderer (which
+                // draws only width>0 chars) and wrap math see real columns.
+                '\t' => {
+                    let pad = 8 - col % 8;
+                    for _ in 0..pad {
+                        cleaned.push(' ');
+                    }
+                    col += pad;
+                }
+                c => {
+                    cleaned.push(c);
+                    col += UnicodeWidthChar::width(c).unwrap_or(0);
+                }
+            }
+        }
         if !cleaned.is_empty() {
             current.push((style, cleaned));
         }
@@ -358,6 +392,38 @@ fn push_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|(_, t)| t.as_str()).collect())
+            .collect()
+    }
+
+    /// Tabs must be expanded to 8-column stops at load time; the renderer
+    /// draws only width>0 chars, so a raw tab would vanish (and take the
+    /// indentation of tab-indented files — Go, Makefiles — with it).
+    #[test]
+    fn tabs_expand_to_tab_stops() {
+        let lines = highlight_file("a\tb\n\tx\n", "");
+        assert_eq!(plain(&lines), vec!["a       b".to_string(), "        x".to_string()]);
+    }
+
+    /// Tab stops are computed from the display column, not the byte offset,
+    /// so a wide char before the tab shifts the expansion.
+    #[test]
+    fn tab_stops_use_display_columns() {
+        let lines = highlight_file("あ\tb", ""); // 'あ' is width 2 -> tab fills to col 8
+        assert_eq!(plain(&lines), vec!["あ      b".to_string()]);
+    }
+
+    /// Tab expansion must also apply on the highlighted path (spans from
+    /// tree-sitter events), not just the plain-text fallback.
+    #[test]
+    fn tabs_expand_in_highlighted_source() {
+        let lines = highlight_file("fn main() {\n\tlet x = 1;\n}\n", "demo.rs");
+        assert_eq!(plain(&lines)[1], "        let x = 1;");
+    }
 
     /// Smoke test for the tree-sitter parse + highlight path: catches a broken
     /// grammar/core ABI after a tree-sitter dependency bump (the build alone
