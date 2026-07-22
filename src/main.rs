@@ -14,6 +14,27 @@ fn main() -> ExitCode {
     let mut wrap = true;
     let mut numbers = false;
     let mut start = StartAction::None;
+
+    // Default options from the CLESS env var (like less's LESS), applied before
+    // argv so command-line flags win. Malformed tokens warn but don't abort;
+    // the warning is surfaced on the pager status line, not stderr.
+    let mut warning: Option<String> = None;
+    if let Ok(value) = env::var("CLESS") {
+        let (settings, warnings) = pager::parse_cless_env(&value);
+        if let Some(w) = settings.wrap {
+            wrap = w;
+        }
+        if let Some(n) = settings.numbers {
+            numbers = n;
+        }
+        if let Some(s) = settings.start {
+            start = s;
+        }
+        if !warnings.is_empty() {
+            warning = Some(format!("CLESS: {}", warnings.join("; ")));
+        }
+    }
+
     let mut paths: Vec<&str> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -82,7 +103,7 @@ fn main() -> ExitCode {
         paths.iter().map(|p| Source::file(*p, *p)).collect()
     };
 
-    if let Err(e) = pager::run(sources, wrap, numbers, start) {
+    if let Err(e) = pager::run(sources, wrap, numbers, start, warning) {
         eprintln!("cless: {}", e);
         return ExitCode::from(1);
     }

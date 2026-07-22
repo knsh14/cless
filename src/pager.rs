@@ -66,6 +66,43 @@ pub fn parse_plus(rest: &str) -> Option<StartAction> {
     }
 }
 
+/// Default startup options parsed from the `CLESS` environment variable. A
+/// `None` field means "not specified" — the built-in default stands and the
+/// command line still decides. Applied before argv, so command-line flags win.
+pub struct EnvSettings {
+    pub wrap: Option<bool>,
+    pub numbers: Option<bool>,
+    pub start: Option<StartAction>,
+}
+
+/// Parse the value of the `CLESS` env var into default options, following
+/// `less`'s `LESS`: options only (`-S`, `-N`, `-p pattern`, `+cmd`), split on
+/// whitespace with no shell quoting. Unrecognized or malformed tokens — unknown
+/// options, a trailing `-p` with no pattern, a bad `+cmd`, or a bare non-option
+/// word — are collected as short warnings and skipped rather than aborting, so a
+/// typo in the environment never makes the tool unusable. `pub` for `main.rs`.
+pub fn parse_cless_env(value: &str) -> (EnvSettings, Vec<String>) {
+    let mut settings = EnvSettings { wrap: None, numbers: None, start: None };
+    let mut warnings = Vec::new();
+    let mut tokens = value.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        match tok {
+            "-S" => settings.wrap = Some(false),
+            "-N" => settings.numbers = Some(true),
+            "-p" => match tokens.next() {
+                Some(pat) => settings.start = Some(StartAction::Search(pat.to_string())),
+                None => warnings.push("-p missing pattern".to_string()),
+            },
+            _ if tok.starts_with('+') => match parse_plus(&tok[1..]) {
+                Some(a) => settings.start = Some(a),
+                None => warnings.push(format!("unsupported start command {}", tok)),
+            },
+            _ => warnings.push(format!("ignored {}", tok)),
+        }
+    }
+    (settings, warnings)
+}
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -88,9 +125,10 @@ pub fn run(
     wrap: bool,
     numbers: bool,
     start: StartAction,
+    warning: Option<String>,
 ) -> io::Result<()> {
     let _guard = TerminalGuard::enter()?;
-    let mut pager = Pager::new(sources, wrap, numbers, start)?;
+    let mut pager = Pager::new(sources, wrap, numbers, start, warning)?;
     pager.run()
 }
 
@@ -195,6 +233,7 @@ impl Pager {
         wrap: bool,
         numbers: bool,
         start: StartAction,
+        warning: Option<String>,
     ) -> io::Result<Self> {
         let mut pager = Self {
             sources,
@@ -222,6 +261,10 @@ impl Pager {
             rows: 24,
         };
         pager.load(0)?;
+        // Surface any CLESS-parse warning on the status line: load() leaves
+        // message untouched, and the first keypress clears it like other
+        // transient status. stderr would be wiped by the alternate screen.
+        pager.message = warning;
         Ok(pager)
     }
 
@@ -1704,7 +1747,7 @@ mod tests {
 
     fn pager_with(n: usize) -> Pager {
         let lines: Vec<Line> = (0..n).map(|i| line(&format!("line {}", i))).collect();
-        let mut p = Pager::new(vec![Source::memory("t", lines)], false, false, StartAction::None).unwrap();
+        let mut p = Pager::new(vec![Source::memory("t", lines)], false, false, StartAction::None, None).unwrap();
         p.cols = 80;
         p.rows = 24;
         p
@@ -1751,7 +1794,7 @@ mod tests {
         let a: Vec<Line> = (0..10).map(|i| line(&format!("a{}", i))).collect();
         let b: Vec<Line> = (0..5).map(|i| line(&format!("b{}", i))).collect();
         let mut p =
-            Pager::new(vec![Source::memory("a", a), Source::memory("b", b)], false, false, StartAction::None).unwrap();
+            Pager::new(vec![Source::memory("a", a), Source::memory("b", b)], false, false, StartAction::None, None).unwrap();
         p.cols = 80;
         p.rows = 24;
         assert_eq!((p.index, p.lines.len()), (0, 10));
@@ -1775,7 +1818,7 @@ mod tests {
         std::fs::write(&path, "line1\n").unwrap();
 
         let mut p =
-            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false, StartAction::None).unwrap();
+            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false, StartAction::None, None).unwrap();
         p.cols = 80;
         p.rows = 24;
         let n0 = p.lines.len();
@@ -1831,7 +1874,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("cless_followsync_{}.txt", std::process::id()));
         std::fs::write(&path, "line1\n").unwrap();
         let mut p =
-            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false, StartAction::None).unwrap();
+            Pager::new(vec![Source::file("f", path.to_str().unwrap())], false, false, StartAction::None, None).unwrap();
         p.cols = 80;
         p.rows = 24;
         assert_eq!(p.lines.len(), 1);
@@ -1866,5 +1909,44 @@ mod tests {
         assert!(matches!(parse_plus("1"), Some(StartAction::Line(0))));
         assert!(parse_plus("bogus").is_none());
         assert!(parse_plus("").is_none());
+    }
+
+    #[test]
+    fn parse_cless_env_forms() {
+        // Empty is a no-op: nothing overridden, no warnings.
+        let (s, w) = parse_cless_env("");
+        assert!(s.wrap.is_none() && s.numbers.is_none() && s.start.is_none());
+        assert!(w.is_empty());
+
+        // Recognized flags set their overrides.
+        let (s, w) = parse_cless_env("-N -S");
+        assert_eq!(s.numbers, Some(true));
+        assert_eq!(s.wrap, Some(false));
+        assert!(w.is_empty());
+
+        // -p consumes the next token as a search pattern.
+        let (s, w) = parse_cless_env("-p foo");
+        assert!(matches!(s.start, Some(StartAction::Search(ref p)) if p == "foo"));
+        assert!(w.is_empty());
+
+        // +cmd routes through parse_plus.
+        let (s, w) = parse_cless_env("+G");
+        assert!(matches!(s.start, Some(StartAction::End)));
+        assert!(w.is_empty());
+
+        // Unknown option: warned and ignored, nothing overridden.
+        let (s, w) = parse_cless_env("-Q");
+        assert!(s.wrap.is_none() && s.numbers.is_none() && s.start.is_none());
+        assert_eq!(w.len(), 1);
+
+        // -p with no following token: warned, start left unset.
+        let (s, w) = parse_cless_env("-p");
+        assert!(s.start.is_none());
+        assert_eq!(w.len(), 1);
+
+        // A bare (non-option) token is not a file here; warn and skip.
+        let (s, w) = parse_cless_env("somefile");
+        assert!(s.wrap.is_none() && s.numbers.is_none() && s.start.is_none());
+        assert_eq!(w.len(), 1);
     }
 }
